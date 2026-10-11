@@ -1,0 +1,17 @@
+{
+  "name": "canvas-interface",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env CanvasInterface.js",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --check CanvasInterface.js && node --check db/node-adapter.js"
+  },
+  "dependencies": {
+    "mammoth": "1.13.0",
+    "officeparser": "8.1.1",
+    "unpdf": "1.8.1"
+  }
+}

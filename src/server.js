@@ -1,0 +1,161 @@
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const https = require('https');
+const tls = require('tls');
+const express = require('express');
+
+const app = express();
+const PORT = 3982;
+
+// --- CONFIGURATION ---
+const DUCK_DOMAIN = 'bearbones';
+const { DUCK_TOKEN, openrouter_key } = require('./secrets');
+const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+
+// Metadata tracking object
+const serverState = {
+	lastIpUpdate: 'Never',
+	lastIpStatus: 'Initializing',
+	lastCertCheck: 'Never',
+	certReloadCount: 0,
+	startTime: new Date().toISOString()
+};
+
+// Helper: Dynamically find Posh-ACME directory for your domain
+function findCertPaths() {
+	const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+	const poshAcmeDir = path.join(localAppData, 'Posh-ACME');
+
+	function searchDir(dir) {
+		try {
+			const entries = fs.readdirSync(dir, { withFileTypes: true });
+			for (const entry of entries) {
+				const fullPath = path.join(dir, entry.name);
+				if (entry.isDirectory()) {
+					if (entry.name === `${DUCK_DOMAIN}.duckdns.org`) {
+						return fullPath;
+					}
+					const found = searchDir(fullPath);
+					if (found) return found;
+				}
+			}
+		} catch (e) {
+			// Ignore permission or missing folder errors during recursion
+		}
+		return null;
+	}
+
+	const certFolder = searchDir(poshAcmeDir);
+	if (!certFolder) {
+		throw new Error(`Could not locate Posh-ACME folder for ${DUCK_DOMAIN}.duckdns.org`);
+	}
+
+	return {
+		cert: path.join(certFolder, 'fullchain.cer'),
+		key: path.join(certFolder, 'cert.key')
+	};
+}
+
+// Helper: Load initial certificates securely
+function loadInitialCerts() {
+	const paths = findCertPaths();
+	return {
+		key: fs.readFileSync(paths.key),
+		cert: fs.readFileSync(paths.cert),
+		mtime: fs.statSync(paths.key).mtimeMs
+	};
+}
+
+// Initialize HTTPS Server
+let certData;
+try {
+	certData = loadInitialCerts();
+	console.log('[SSL] Certificates successfully loaded on startup.');
+} catch (err) {
+	console.error('[SSL Error] Failed to load certificates on startup:', err.message);
+	process.exit(1); // Exit if initial certs are missing
+}
+
+const server = https.createServer({
+	key: certData.key,
+	cert: certData.cert
+}, app);
+
+let lastKeyMtime = certData.mtime;
+
+// --- ROUTES ---
+app.get('/', (req, res) => {
+	const clientIp = req.ip || req.socket.remoteAddress;
+	res.send(`
+		<html>
+			<head><title>Bearbones API Server</title></head>
+			<body style="font-family: Arial, sans-serif; padding: 40px;">
+				<h1 style="color: #2bcb5c;">Port Forwarding Test Successful!</h1>
+				<p>Connected securely to port <b>${PORT}</b>.</p>
+				<p>Your incoming IP: <code>${clientIp}</code></p>
+				<hr style="border: 0; border-top: 1px solid #ddd; margin: 20px 0;" />
+				<h3>Server Metadata Status</h3>
+				<ul>
+					<li><b>Server Uptime Started:</b> ${serverState.startTime}</li>
+					<li><b>Last DuckDNS Update:</b> ${serverState.lastIpUpdate} (${serverState.lastIpStatus})</li>
+					<li><b>Cert Hot-Reloads:</b> ${serverState.certReloadCount}</li>
+				</ul>
+			</body>
+		</html>
+	`);
+});
+
+// --- BACKGROUND MAINTENANCE LOOP (DuckDNS + Cert Hot-Reload) ---
+async function backgroundTask() {
+	// 1. DuckDNS Check (Wrapped in try/catch so a dead internet connection never crashes the app)
+	try {
+		const url = `https://www.duckdns.org/update?domains=${DUCK_DOMAIN}&token=${DUCK_TOKEN}&ip=`;
+		const response = await fetch(url);
+		const body = await response.text();
+		
+		serverState.lastIpUpdate = new Date().toISOString();
+		if (body.includes('OK')) {
+			serverState.lastIpStatus = 'SUCCESS (OK)';
+			console.log(`[DuckDNS] ${serverState.lastIpUpdate} - IP updated successfully.`);
+		} else {
+			serverState.lastIpStatus = `FAILED (${body.trim()})`;
+			console.warn(`[DuckDNS] Update rejected:`, body);
+		}
+	} catch (err) {
+		serverState.lastIpUpdate = new Date().toISOString();
+		serverState.lastIpStatus = `OFFLINE (${err.message})`;
+		console.warn(`[DuckDNS] Network issue detected. Skipping this interval. Details:`, err.message);
+	}
+
+	// 2. Certificate Check & Hot-Reload
+	try {
+		serverState.lastCertCheck = new Date().toISOString();
+		const paths = findCertPaths();
+		const keyStat = fs.statSync(paths.key);
+
+		if (keyStat.mtimeMs !== lastKeyMtime) {
+			console.log('[SSL] New certificate modification detected. Hot-swapping...');
+			
+			const newContext = tls.createSecureContext({
+				key: fs.readFileSync(paths.key),
+				cert: fs.readFileSync(paths.cert)
+			});
+			
+			server.setSecureContext(newContext);
+			lastKeyMtime = keyStat.mtimeMs;
+			serverState.certReloadCount++;
+			console.log('[SSL] Certificates successfully reloaded live without restart.');
+		}
+	} catch (err) {
+		console.warn('[SSL] Could not check/reload certificates:', err.message);
+	}
+}
+
+// Start interval loop
+setInterval(backgroundTask, INTERVAL_MS);
+
+// Start listening
+server.listen(PORT, '0.0.0.0', () => {
+	console.log(`Secure server running live at https://bearbones.duckdns.org:${PORT}`);
+});
