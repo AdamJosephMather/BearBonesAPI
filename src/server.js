@@ -8,6 +8,9 @@ const express = require('express');
 const app = express();
 const PORT = 3982;
 
+// For json in/out
+app.use(express.json())
+
 // --- CONFIGURATION ---
 const DUCK_DOMAIN = 'bearbones';
 const { DUCK_TOKEN, openrouter_key } = require('./secrets');
@@ -104,6 +107,46 @@ app.get('/', (req, res) => {
 			</body>
 		</html>
 	`);
+});
+
+// 1. /sync endpoint (accepts token as string, returns JSON)
+app.post('/sync', (req, res) => {
+	const { token } = req.body;
+
+	// Basic validation to ensure a token was provided
+	if (!token) {
+		return res.status(400).json({ error: 'Token is required' });
+	}
+
+	// TODO: Add your logic to verify the token here
+	console.log(`[API] Received sync request with token: ${token}`);
+
+	// Send back a JSON response
+	res.json({
+		status: 'success',
+		message: 'Token received successfully',
+		receivedAt: new Date().toISOString()
+	});
+});
+
+// 2. /findit endpoint (Accepts state JSON, returns JSON)
+app.post('/findit', (req, res) => {
+	const stateData = req.body;
+
+	// Basic validation to ensure state data isn't empty
+	if (!stateData || Object.keys(stateData).length === 0) {
+		return res.status(400).json({ error: 'State data is required' });
+	}
+
+	// TODO: Add your logic to process the state here
+	console.log('[API] Received state update:', stateData);
+
+	// Send back a JSON response
+	res.json({
+		status: 'success',
+		message: 'State processed successfully',
+		echoState: stateData
+	});
 });
 
 // --- BACKGROUND MAINTENANCE LOOP (DuckDNS + Cert Hot-Reload) ---
