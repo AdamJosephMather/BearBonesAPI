@@ -6,13 +6,14 @@ import secrets
 BASE_URL = "https://bearbones.duckdns.org:3982"
 
 canvas_token = secrets.canvas_token
+bad_token = "This is a bad token"
 
-def test_sync():
+def test_sync(token):
 	print("\n--- Testing /sync Endpoint ---")
 	url = f"{BASE_URL}/sync"
 
 	# Payload containing the token string
-	payload = {"token": canvas_token}
+	payload = {"token": token}
 
 	try:
 		response = requests.post(url, json=payload, verify=True)
@@ -22,13 +23,13 @@ def test_sync():
 		print(f"Error connecting to /sync: {e}")
 
 
-def test_findit():
+def test_findit(token):
 	print("\n--- Testing /findit Endpoint ---")
 	url = f"{BASE_URL}/findit"
 
 	# Payload containing some state data (JSON)
 	state_payload = {
-			"token": canvas_token,
+			"token": token,
 			"messages": [
 				{"content":"Do I have any conflicts with my midterm?", "role":"user"}
 			]
@@ -44,5 +45,11 @@ def test_findit():
 
 if __name__ == "__main__":
 	print(f"Starting API tests against {BASE_URL}...")
-	test_sync()
-	test_findit()
+	
+	print(f"\n=== GOOD TOKEN ===")
+	test_sync(canvas_token)
+	test_findit(canvas_token)
+	
+	print(f"\n=== BAD TOKEN ===")
+	test_sync(bad_token)
+	test_findit(bad_token)

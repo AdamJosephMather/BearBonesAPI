@@ -1,9 +1,11 @@
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const https = require('https');
-const tls = require('tls');
-const express = require('express');
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+import https from 'https';
+import tls from 'tls';
+import express from 'express';
+import { DUCK_TOKEN, openrouter_key } from './secrets.js';
+import * as canvas_interface from './CanvasInterface.js'
 
 const app = express();
 const PORT = 3982;
@@ -12,9 +14,9 @@ const PORT = 3982;
 app.use(express.json())
 
 // --- CONFIGURATION ---
-const DUCK_DOMAIN = 'bearbones';
-const { DUCK_TOKEN, openrouter_key } = require('./secrets');
-const INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const DUCK_DOMAIN        = 'bearbones';
+const SERVER_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const SYNC_INTERVAL_MS   = 4 * 60 * 60 * 1000; // 4 hours
 
 // Metadata tracking object
 const serverState = {
@@ -110,7 +112,7 @@ app.get('/', (req, res) => {
 });
 
 // 1. /sync endpoint (accepts token as string, returns JSON)
-app.post('/sync', (req, res) => {
+app.post('/sync', async (req, res) => {
 	const { token } = req.body;
 
 	// Basic validation to ensure a token was provided
@@ -120,13 +122,10 @@ app.post('/sync', (req, res) => {
 
 	// TODO: Add your logic to verify the token here
 	console.log(`[API] Received sync request with token: ${token}`);
-
-	// Send back a JSON response
-	res.json({
-		status: 'success',
-		message: 'Token received successfully',
-		receivedAt: new Date().toISOString()
-	});
+	
+	let output = await canvas_interface.getClientSync(token);
+	
+	res.json(output);
 });
 
 // 2. /findit endpoint (Accepts state JSON, returns JSON)
@@ -195,8 +194,17 @@ async function backgroundTask() {
 	}
 }
 
+async function syncToCanvas() {
+	await canvas_interface.canvasSync();
+}
+
 // Start interval loop
-setInterval(backgroundTask, INTERVAL_MS);
+setInterval(backgroundTask, SERVER_INTERVAL_MS);
+
+await canvas_interface.start();
+await syncToCanvas();
+
+setInterval(syncToCanvas, SYNC_INTERVAL_MS); // does not start until 4 hours from now.
 
 // Start listening
 server.listen(PORT, '0.0.0.0', () => {

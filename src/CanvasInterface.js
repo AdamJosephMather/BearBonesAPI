@@ -1,9 +1,22 @@
-import * as db from './db/node-adapter.js';
+import { DatabaseManager } from './db/node-adapter.js';
 import path from 'node:path'
 
-import { pathToFileURL } from 'node:url';
-
 const cwd = process.cwd();
+
+let canvas_db_path = process.env.CANVAS_DB_PATH || path.join(cwd, "canvas_db.db");
+let user_db_path = process.env.USER_DB_PATH || path.join(cwd, "user_db.db");
+
+const db = new DatabaseManager(canvas_db_path);
+const user_db = new DatabaseManager(user_db_path);
+// A separate connection only sees published, committed course snapshots.
+const cache_db = new DatabaseManager(canvas_db_path);
+let userDbQueue = Promise.resolve();
+let initialization;
+function withUserDb(operation) {
+	const result = userDbQueue.then(operation);
+	userDbQueue = result.catch(() => {});
+	return result;
+}
 
 // These sets are to be reset on each sync. They will keep track of already indexed files, and also will tell us which files we have not seen this search, so that we can rid ourselves of them when we're done
 const page_set       = new Set();
@@ -16,10 +29,40 @@ const discussion_set = new Set();
 // this will store assignment ids and associate them with the module they came from. This is so that we don't have to do individual searches per assignment, and rather the bulk search just once
 const assignment_map = new Map();
 
-//const canvas_token = process.env.CANVAS_TOKEN;
-//const openrouter_key = process.env.OPENROUTER_API_KEY;
-const canvas_token = "CANVAS_TOKEN_HERE";
-const { DUCK_TOKEN, openrouter_key } = require('./secrets');
+import { openrouter_key as configuredOpenrouterKey } from './secrets.js';
+const openrouter_key = process.env.OPENROUTER_API_KEY || configuredOpenrouterKey;
+
+let syncing = false;
+let syncTransactionStarted = false;
+let activeSync;
+let syncQueued = false;
+let queuedSyncHandle;
+
+function scheduleQueuedSync() {
+	if (!syncQueued || syncing || queuedSyncHandle) return;
+	// Start on the next event-loop turn, after getClientSync returns its response.
+	queuedSyncHandle = setImmediate(() => {
+		queuedSyncHandle = undefined;
+		if (!syncQueued || syncing) return;
+		canvasSync().catch(error => console.error('Background Canvas sync failed:', error.message));
+	});
+}
+
+function queueCanvasSync() {
+	// Coalesce client requests into one pending run. A running sync may already
+	// have read its enrollment list, so new courses require a subsequent run.
+	syncQueued = true;
+	scheduleQueuedSync();
+}
+
+// Persist a complete source and its AI facts together. CourseSnapshots are only
+// rebuilt after discovery and cleanup finish, so clients never see partial work.
+async function partialSave() {
+	await db.execute('COMMIT');
+	syncTransactionStarted = false;
+	await db.execute('BEGIN IMMEDIATE');
+	syncTransactionStarted = true;
+}
 
 const openrouter_url = "https://openrouter.ai/api/v1/";
 
@@ -28,22 +71,6 @@ const base_url = (process.env.CANVAS_BASE_URL || "https://canvas.ualberta.ca/api
 const TEXT_EXTS = new Set(['txt', 'md', 'markdown', 'html', 'htm', 'csv', 'json', 'xml', 'rtf']);
 const OFFICE_EXTS = new Set(['pptx', 'xlsx', 'odt', 'odp', 'ods']);
 const MAX_CHARS = 200_000; // tune to your model's context
-
-//import * as readline from 'readline';
-//
-//const waitUntilEnter = () => {
-//	const rl = readline.createInterface({
-//		input: process.stdin,
-//		output: process.stdout
-//	});
-//	
-//	return new Promise((resolve) => {
-//		rl.on('line', () => {
-//			rl.close();
-//			resolve();
-//		});
-//	});
-//};
 
 async function extractFileText(buffer, filename) {
 	const ext = (filename.split('.').pop() || '').toLowerCase();
@@ -104,7 +131,7 @@ async function fetchModelResponse(prompt) {
 //	console.log(prompt);
 //	console.log("Waiting until enter to run AI.");
 //	await waitUntilEnter();
-	
+
 	const url = openrouter_url + 'chat/completions';
 	try {
 		const response = await fetch(url, {
@@ -120,7 +147,7 @@ async function fetchModelResponse(prompt) {
 				reasoning: { effort: 'low' },
 				provider: { order: ["Relace", "Wafer", "inference.net", "DeepInfra", "StreamLake", "DeepSeek", "NovitaAI", "Baseten", "Modal", "Parasail", "Venice", "GMICloud"], allow_fallbacks: true }
 			}),
-			
+
 			signal: AbortSignal.timeout(120_000),
 		});
 
@@ -136,7 +163,7 @@ async function fetchModelResponse(prompt) {
 	}
 }
 
-async function fetchData(url) {
+async function fetchData(url, canvas_token) {
 	try {
 		let next = new URL(url, base_url).href;
 		let result;
@@ -194,49 +221,49 @@ function normalizeCanvasIds(value) {
 async function createPrompt(course_id, module_id, prompt_addition) {
 	const moduleInfo = await db.query('SELECT * FROM Modules WHERE id = ?', [module_id]);
 	const courseInfo = await db.query('SELECT * FROM Courses WHERE id = ?', [course_id]);
-	
+
 	let moduleName = "Could not find module.";
 	let courseName = "Could not find course.";
-	
+
 	if (moduleInfo.length !== 0) {
 		moduleName = moduleInfo[0].name;
 	}
 	if (courseInfo.length !== 0) {
 		courseName = courseInfo[0].name;
 	}
-	
+
 	let event_list = [];
-	
+
 	const existing_saved_events = await db.query(`SELECT * FROM SavedEvents e WHERE course_id = ?
 		AND (EXISTS (SELECT 1 FROM DateFacts WHERE applies_to = e.id)
 		OR EXISTS (SELECT 1 FROM CreationFacts WHERE applies_to = e.id))`, [course_id]);
-	
+
 	for (const savedEvent of existing_saved_events) {
 		let id = savedEvent.id;
 		let title = savedEvent.title;
 		let description = savedEvent.description;
-		
+
 		let eventStr = `ID: ${id} TITLE: ${title}:\n## Description: ${description}`;
-		
+
 		const dates = await db.query('SELECT * FROM DateFacts WHERE applies_to = ?', [id]);
-		
+
 		if (dates.length != 0) {
 			eventStr += "\n## Dates:";
 		}
-		
+
 		for (const dateFact of dates) {
 			eventStr += `\n${dateFact.date} ${dateFact.time ?? ''} - ${dateFact.info}`;
 		}
-		
+
 		event_list.push(eventStr);
 	}
-	
+
 	let existing_events = event_list.join('\n');
-	
+
 	if (event_list.length == 0) {
 		existing_events = "No existing events in our system yet.";
 	}
-	
+
 	let prompt = `
 # Your Job
 
@@ -297,7 +324,7 @@ ${existing_events}
 # Information to Extract Events From:
 
 ${prompt_addition}`;
-	
+
 	return prompt;
 }
 
@@ -320,9 +347,9 @@ function validateDateFact(fact) {
 async function updateSavedEvents(res, from_type, from_id, course_id, module_id) {
 	try {
 		const content = res?.choices?.[0]?.message?.content;
-		
+
 		console.log(content);
-		
+
 		if (typeof content !== 'string') return 'No message content in AI response';
 		const result = JSON.parse(content.trim().replace(/^\x60\x60\x60(?:json)?\s*/i, '').replace(/\s*\x60\x60\x60$/, ''));
 		if (!result || typeof result !== 'object' || Array.isArray(result)) return 'Expected an AI response object';
@@ -440,43 +467,19 @@ async function deleteAssignmentSaved(a_id) {
 	console.log(`Deleted assignment (${a_id})`);
 }
 
-async function get_courses() {
-	let url = base_url+"courses";
-	
-	let [data, err, code] = await fetchData(url);
-	
-	if (err !== null) {
-		return [null, err];
-	}
-	
-	return [data, null];
-}
+async function syncCourses(courseAndToken) {
+	for (const [courseid, token] of courseAndToken) {
+		let [course, err, code] = await fetchData(base_url+`courses/${courseid}`, token);
 
-async function delCourse(course) {
-	console.log("Deleted course: "+course.id);
-	
-	await db.run(`DELETE FROM Courses WHERE id IS ?`, [course.id]);
-	await db.run(`DELETE FROM Modules WHERE course_id IS ?`, [course.id]);
-	await db.run(`DELETE FROM DateFacts WHERE course_id IS ?`, [course.id]);
-	await db.run(`DELETE FROM CreationFacts WHERE course_id IS ?`, [course.id]);
-	for (const table of ['Pages', 'Assignments', 'Quizzes', 'Files', 'Externals', 'Discussions', 'SavedEvents']) {
-		await db.run(`DELETE FROM ${table} WHERE course_id = ?`, [course.id]);
-	}
-}
-
-async function syncCourses(courses) {
-	const existing = await db.query('SELECT id FROM Courses');
-	const incomingIds = new Set(courses.map(c => c.id));
-	
-	for (const course of courses) {
-		await db.run('INSERT INTO Courses (id, name, uuid) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, uuid = excluded.uuid', [course.id, course.name, course.uuid]);
-	}
-	
-	for (const course of existing) {
-		if (!incomingIds.has(course.id)) {
-			await delCourse(course);
+		if (err != null) {
+			return err;
 		}
+
+		const name = course.original_name ?? course.name;
+
+		await db.run('INSERT INTO Courses (id, name, uuid) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, uuid = excluded.uuid', [course.id, name, course.uuid]);
 	}
+	return null;
 }
 
 function difference(left, right) {
@@ -503,22 +506,22 @@ async function processPage(course_id, module_id, page, err, code) {
 		}
 		return err;
 	}
-	
+
 	if (page_set.has(page.page_id)) {
 		return null; // let's not do this song and dance again
 	}
-	
+
 	const existing = await db.query('SELECT * FROM Pages WHERE id = ?', [page.page_id]);
-	
+
 	let deleted = false;
 	if (existing.length !== 0 && contentChanged(existing[0], page, ['updated_at', 'title', 'body'])) {
 		await deletePageSaved(existing[0].id);
 		deleted = true;
 	}
-	
+
 	if (deleted || existing.length === 0) {
 		console.log("Added page "+page.title);
-		
+
 		const prompt = await createPrompt(course_id, module_id, `# Page:
 
 Updated Last at: ${formatCanvasDate(page.updated_at)}
@@ -527,26 +530,26 @@ Title: ${page.title}
 Body: ${page.body}
 `);
 		let [res, err] = await fetchModelResponse(prompt);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		err = await updateSavedEvents(res, "page", page.page_id, course_id, module_id);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		await db.run(
 			'INSERT INTO Pages (id, title, updated_at, html_url, course_id, module_id, body) VALUES (?, ?, ?, ?, ?, ?, ?)',
 			[page.page_id, page.title, page.updated_at, page.html_url, course_id, module_id, page.body]
 		);
 	}
-	
+
 	await updateSourceLocation('Pages', 'page', page.page_id, course_id, module_id);
 	page_set.add(page.page_id);
-	
+
 	return null;
 }
 
@@ -554,18 +557,18 @@ async function processAssignment(course_id, module_id, assignment) {
 	if (assignment_set.has(assignment.id)) { // item.content_id is the same
 		return null;
 	}
-	
+
 	const existing = await db.query('SELECT * FROM Assignments WHERE id = ?', [assignment.id]);
-	
+
 	let deleted = false;
 	if (existing.length !== 0 && contentChanged(existing[0], assignment, ['updated_at', 'name', 'description', 'due_at', 'lock_at', 'unlock_at', 'allowed_attempts', 'points_possible', 'grading_type'])) {
 		await deleteAssignmentSaved(existing[0].id);
 		deleted = true;
 	}
-	
+
 	if (deleted || existing.length === 0) {
 		console.log("Added assignments "+assignment.name);
-		
+
 		const prompt = await createPrompt(course_id, module_id, `# Assignment:
 
 Unlocks at: ${formatCanvasDate(assignment.unlock_at)}
@@ -577,17 +580,17 @@ Allowed Attempts: ${assignment.allowed_attempts}
 Description: ${assignment.description}
 `);
 		let [res, err] = await fetchModelResponse(prompt);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		err = await updateSavedEvents(res, "assignment", assignment.id, course_id, module_id);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		await db.run(
 			`INSERT INTO Assignments (
 				id,
@@ -603,11 +606,8 @@ Description: ${assignment.description}
 				allowed_attempts,
 				points_possible,
 				grading_type,
-				has_submitted_submissions,
-				locked_for_user,
-				graded_submissions_exist,
 				is_quiz_assignment
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				assignment.id,
 				assignment.name,
@@ -622,48 +622,26 @@ Description: ${assignment.description}
 				assignment.allowed_attempts,
 				assignment.points_possible,
 				assignment.grading_type,
-				assignment.has_submitted_submissions,
-				assignment.locked_for_user,
-				assignment.graded_submissions_exist,
 				assignment.is_quiz_assignment
 			]
 		);
-	}else if (
-		existing[0].has_submitted_submissions != assignment.has_submitted_submissions ||
-		existing[0].graded_submissions_exist != assignment.graded_submissions_exist ||
-		existing[0].locked_for_user != assignment.locked_for_user
-	) {
-		// this doesn't have an update to info that the AI needs to investigate, only means assignment date has elapsed
-		console.log("Update assignments (2) "+assignment.name);
-		
-		await db.run(
-			`UPDATE Assignments SET 
-				has_submitted_submissions = ?,
-				locked_for_user = ?,
-				graded_submissions_exist = ?
-				WHERE id = ?`,
-			[
-				assignment.has_submitted_submissions,
-				assignment.locked_for_user,
-				assignment.graded_submissions_exist,
-				assignment.id
-			]
-		);
 	}
-	
+
 	await updateSourceLocation('Assignments', 'assignment', assignment.id, course_id, module_id);
 	assignment_set.add(assignment.id);
-	
+
 	return null;
 }
 
 async function processQuiz(course_id, module_id, quiz) {
+	const baseDates = Array.isArray(quiz.all_dates) ? quiz.all_dates.find(date => date.base === true) : null;
+	if (Array.isArray(quiz.all_dates)) quiz = { ...quiz, due_at: baseDates?.due_at ?? null, lock_at: baseDates?.lock_at ?? null, unlock_at: baseDates?.unlock_at ?? null };
 	if (quiz_set.has(quiz.id)) { // content_id
 		return null;
 	}
-	
+
 	const existing = await db.query('SELECT * FROM Quizzes WHERE id = ?', [quiz.id]);
-	
+
 	if (existing.length && contentChanged(existing[0], quiz, [
 		'title', 'description', 'quiz_type', 'scoring_policy', 'allowed_attempts',
 		'question_count', 'points_possible', 'due_at', 'lock_at', 'unlock_at', 'version_number'
@@ -673,7 +651,7 @@ async function processQuiz(course_id, module_id, quiz) {
 		'question_count', 'points_possible', 'due_at', 'lock_at', 'unlock_at', 'version_number'
 	])) {
 		console.log("Added quiz "+quiz.title);
-		
+
 		const prompt = await createPrompt(course_id, module_id, `# Quiz:
 
 Unlocks at: ${formatCanvasDate(quiz.unlock_at)}
@@ -686,17 +664,17 @@ Question Count: ${quiz.question_count}
 Description: ${quiz.description}
 `);
 		let [res, err] = await fetchModelResponse(prompt);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		err = await updateSavedEvents(res, "quiz", quiz.id, course_id, module_id);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		await db.run(
 			`INSERT INTO Quizzes (
 				id,
@@ -712,11 +690,10 @@ Description: ${quiz.description}
 				lock_at,
 				unlock_at,
 				published,
-				locked_for_user,
 				version_number,
 				course_id,
 				module_id
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				quiz.id,
 				quiz.title,
@@ -731,38 +708,19 @@ Description: ${quiz.description}
 				quiz.lock_at,
 				quiz.unlock_at,
 				quiz.published,
-				quiz.locked_for_user,
 				quiz.version_number,
 				course_id,
 				module_id
 			]
 		);
-	}else if (
-		existing[0].locked_for_user != quiz.locked_for_user ||
-		existing[0].version_number != quiz.version_number ||
-		existing[0].published != quiz.published
-	) {
-		// this doesn't have an update to info that the AI needs to investigate, only means quiz date has elapsed
-		console.log("Update quiz (2) "+quiz.title);
-		
-		await db.run(
-			`UPDATE Quizzes SET 
-				locked_for_user = ?,
-				version_number = ?,
-				published = ?
-				WHERE id = ?`,
-			[
-				quiz.locked_for_user,
-				quiz.version_number,
-				quiz.published,
-				quiz.id
-			]
-		);
+	} else {
+		await db.run('UPDATE Quizzes SET published = ? WHERE id = ?', [quiz.published, quiz.id]);
 	}
-	
+
+	await db.run('UPDATE Quizzes SET assignment_id = ? WHERE id = ?', [quiz.assignment_id, quiz.id]);
 	await updateSourceLocation('Quizzes', 'quiz', quiz.id, course_id, module_id);
 	quiz_set.add(quiz.id);
-	
+
 	return null;
 }
 
@@ -773,28 +731,28 @@ async function processFile(course_id, module_id, item, file, err, code) {
 		}
 		return err;
 	}
-	
+
 	if (files_set.has(file.id)) { // content_id
 		return null;
 	}
-	
+
 	const existing = await db.query('SELECT * FROM Files WHERE id = ?', [file.id]);
-	
+
 	let deleted = false;
 	if (existing.length !== 0 && contentChanged(existing[0], file, ['updated_at', 'filename', 'unlock_at', 'lock_at'])) {
 		await deleteFileSaved(existing[0].id);
 		deleted = true;
 	}
-	
+
 	if (existing.length === 0 || deleted) {
 		console.log("Added file "+file.display_name);
-		
+
 		let file_data;
 		const [buffer, dlErr] = await downloadIntoMemory(file.url);
 		if (dlErr !== null) {
 			return dlErr;
 		}
-		
+
 		const [text, extractErr] = await extractFileText(buffer, file.filename);
 		if (extractErr !== null) {
 			// Don't fail the whole item over an unreadable file; tell the model so it
@@ -804,7 +762,7 @@ async function processFile(course_id, module_id, item, file, err, code) {
 		} else {
 			file_data = text;
 		}
-		
+
 		const prompt = await createPrompt(course_id, module_id, `# File:
 
 Last Updated at: ${formatCanvasDate(file.updated_at)}
@@ -815,17 +773,17 @@ Filename: ${file.filename}
 File: ${file_data}
 `);
 		let [res, err] = await fetchModelResponse(prompt);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		err = await updateSavedEvents(res, "file", file.id, course_id, module_id);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		await db.run(
 			`INSERT INTO Files (
 				id,
@@ -835,13 +793,11 @@ File: ${file_data}
 				updated_at,
 				unlock_at,
 				lock_at,
-				hidden_for_user,
-				locked_for_user,
 				mime_class,
 				course_id,
 				module_id,
 				url
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				file.id,
 				file.display_name,
@@ -850,34 +806,19 @@ File: ${file_data}
 				file.updated_at,
 				file.unlock_at,
 				file.lock_at,
-				file.hidden_for_user,
-				file.locked_for_user,
 				file.mime_class,
 				course_id,
 				module_id,
 				file.url
 			]
 		);
-	}else if (existing[0].locked_for_user != file.locked_for_user) {
-		// this doesn't have an update to info that the AI needs to investigate, only means file has unlocked/locked
-		console.log("Update file (2) "+file.display_name);
-		
-		await db.run(
-			`UPDATE Files SET 
-				locked_for_user = ?
-				WHERE id = ?`,
-			[
-				file.locked_for_user,
-				file.id
-			]
-		);
 	}
-	
+
 	await updateSourceLocation('Files', 'file', file.id, course_id, module_id);
-	await db.run('UPDATE Files SET url = ?, display_name = ?, hidden_for_user = ?, locked_for_user = ? WHERE id = ?',
-		[file.url, file.display_name, file.hidden_for_user, file.locked_for_user, file.id]);
+	await db.run('UPDATE Files SET url = ?, display_name = ? WHERE id = ?',
+		[file.url, file.display_name, file.id]);
 	files_set.add(file.id);
-	
+
 	return null;
 }
 
@@ -885,12 +826,12 @@ async function processExternal(course_id, module_id, item) {
 	if (external_set.has(item.id)) {
 		return null;
 	}
-	
+
 	const existing = await db.query('SELECT * FROM Externals WHERE id = ?', [item.id]);
-	
+
 	if (!existing.length || contentChanged(existing[0], item, ['title', 'html_url'])) {
 		console.log("Added External "+item.title);
-		
+
 		await db.run(
 			`INSERT OR REPLACE INTO Externals (
 				id,
@@ -908,10 +849,10 @@ async function processExternal(course_id, module_id, item) {
 			]
 		);
 	}
-	
+
 	await updateSourceLocation('Externals', 'external', item.id, course_id, module_id);
 	external_set.add(item.id);
-	
+
 	return null;
 }
 
@@ -924,15 +865,15 @@ async function processDiscussion(course_id, module_id, item, discourse, err, cod
 	if (discussion_set.has(discourse.id)) { // content_id
 		return null;
 	}
-	
+
 	const existing = await db.query('SELECT * FROM Discussions WHERE id = ?', [discourse.id]);
-	
+
 	const changed = existing.length && contentChanged(existing[0], discourse,
-		['title', 'message', 'todo_date', 'published', 'locked_for_user']);
+		['title', 'message', 'todo_date', 'published']);
 	if (changed) await deleteDiscussionSaved(discourse.id);
 	if (!existing.length || changed) {
 		console.log("Added discussion "+discourse.title);
-		
+
 		const prompt = await createPrompt(course_id, module_id, `# Discussion:
 
 Created at: ${formatCanvasDate(discourse.created_at)}
@@ -942,36 +883,34 @@ Title: ${discourse.title}
 Message: ${discourse.message}
 `);
 		let [res, err] = await fetchModelResponse(prompt);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		err = await updateSavedEvents(res, "discussion", discourse.id, course_id, module_id);
-		
+
 		if (err != null) {
 			return err;
 		}
-		
+
 		await db.run(
 			`INSERT INTO Discussions (
 				id,
 				title,
 				created_at,
 				published,
-				locked_for_user,
 				html_url,
 				message,
 				todo_date,
 				course_id,
 				module_id
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				discourse.id,
 				discourse.title,
 				discourse.created_at,
 				discourse.published,
-				discourse.locked_for_user,
 				discourse.html_url,
 				discourse.message,
 				discourse.todo_date,
@@ -980,34 +919,34 @@ Message: ${discourse.message}
 			]
 		);
 	}
-	
+
 	await updateSourceLocation('Discussions', 'discussion', discourse.id, course_id, module_id);
 	discussion_set.add(discourse.id);
-	
+
 	return null;
 }
 
-async function processEvent(course_id, module_id, item) {
+async function processEvent(course_id, module_id, item, canvas_token) {
 	if (item.type === "SubHeader") {
 		return null;
 	}
-	
+
 	if (item.type === "ExternalTool" || item.type === "ExternalUrl") {
 		if (external_set.has(item.id)) {
 			return null;
 		}
 		return await processExternal(course_id, module_id, item);
 	}else if (item.type === "Page") {
-		let [item_specifics, err, code] = await fetchData(item.url);
+		let [item_specifics, err, code] = await fetchData(item.url, canvas_token);
 		return await processPage(course_id, module_id, item_specifics, err, code);
 	}else if (item.type === "Assignment") {
 		// we bulk search assignments
-		assignment_map.set(item.content_id, [course_id, module_id])
+		assignment_map.set(item.content_id, [course_id, module_id, canvas_token])
 	}else if (item.type === "Quiz") {
 		if (quiz_set.has(item.content_id)) {
 			return null; // already handled
 		}
-		let [item_specifics, err, code] = await fetchData(item.url);
+		let [item_specifics, err, code] = await fetchData(item.url, canvas_token);
 		if (err !== null && (code == 404)) {
 			return null;
 		}else if (err !== null) {
@@ -1018,94 +957,98 @@ async function processEvent(course_id, module_id, item) {
 		if (discussion_set.has(item.content_id)) {
 			return null; // already handled
 		}
-		let [item_specifics, err, code] = await fetchData(item.url);
+		let [item_specifics, err, code] = await fetchData(item.url, canvas_token);
 		return await processDiscussion(course_id, module_id, item, item_specifics, err, code);
 	}else if (item.type === "File") {
 		if (files_set.has(item.content_id)) {
 			return null; // already handled
 		}
-		let [item_specifics, err, code] = await fetchData(item.url);
+		let [item_specifics, err, code] = await fetchData(item.url, canvas_token);
 		return await processFile(course_id, module_id, item, item_specifics, err, code);
 	}else{
 		return `Missing type of ModuleItem (${item.type})`;
 	}
-	
+
 	return null;
 }
 
-async function syncAssignments(course) {
-	let [assignments, err, code] = await fetchData(base_url+`courses/${course.id}/assignments?include[]=all_dates`);
-	
+async function syncAssignments(course_id, canvas_token) {
+	let [assignments, err, code] = await fetchData(base_url+`courses/${course_id}/assignments?override_assignment_dates=false`, canvas_token);
+
 	if (err !== null) {
 		return err;
 	}
-	
+
 	for (const assignment of assignments) {
 		let id = assignment.id;
-		
+
 		if (assignment_map.has(id)) {
-			const processError = await processAssignment(course.id, assignment_map.get(id)[1], assignment);
+			const processError = await processAssignment(course_id, assignment_map.get(id)[1], assignment);
 			if (processError !== null) return processError;
 		}else{
-			const processError = await processAssignment(course.id, null, assignment);
+			const processError = await processAssignment(course_id, null, assignment);
 			if (processError !== null) return processError;
 		}
+		await partialSave();
 	}
-	
+
 	return null;
 }
 
-async function syncEvents(course) {
+async function syncEvents(course_id, canvas_token) {
 	const moduleIds = new Set();
-	let [modules, err, code] = await fetchData(base_url+`courses/${course.id}/modules`);
-	
+	let [modules, err, code] = await fetchData(base_url+`courses/${course_id}/modules`, canvas_token);
+
 	if (err !== null) {
 		return err;
 	}
-	
+
 	for (const course_module of modules) {
 		let id = course_module.id;
 		let name = course_module.name;
 		moduleIds.add(id);
-		
+
 		await db.run(
 			'INSERT INTO Modules (id, name, course_id) VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, course_id = excluded.course_id',
-			[id, name, course.id]
+			[id, name, course_id]
 		);
-		
+		await partialSave();
+
 		let items_url = course_module.items_url;
-		
-		let [items, err, code] = await fetchData(items_url);
-		
+
+		let [items, err, code] = await fetchData(items_url, canvas_token);
+
 		if (err !== null) {
 			return err;
 		}
-		
+
 		for (const item of items) {
-			let err = await processEvent(course.id, course_module.id, item);
+			let err = await processEvent(course_id, course_module.id, item, canvas_token);
 			if (err !== null) {
 				return err;
 			}
+			await partialSave();
 		}
 	}
-	
-	for (const row of await db.query('SELECT id FROM Modules WHERE course_id = ?', [course.id])) {
+
+	for (const row of await db.query('SELECT id FROM Modules WHERE course_id = ?', [course_id])) {
 		if (!moduleIds.has(row.id)) await db.run('DELETE FROM Modules WHERE id = ?', [row.id]);
 	}
+
 	return null;
 }
 
 async function ensureAssignments() {
 	let from_modules = new Set(assignment_map.keys());
 	let whatwedidntdo = difference(from_modules, assignment_set);
-	
+
 	for (const a_id of whatwedidntdo) {
 		console.log(`The direct assignment search missed ${a_id}`);
-		
-		let [courseid, moduleid] = assignment_map.get(a_id);
-		
-		let [assignment, err, code] = await fetchData(base_url+`courses/${courseid}/assignments/${a_id}?include[]=all_dates`);
-		
+
+		let [courseid, moduleid, canvas_token] = assignment_map.get(a_id);
+
+		let [assignment, err, code] = await fetchData(base_url+`courses/${courseid}/assignments/${a_id}?override_assignment_dates=false`, canvas_token);
+
 		if (err != null) {
 			if (code == 404) {
 				console.log(err);
@@ -1114,302 +1057,476 @@ async function ensureAssignments() {
 			}
 			return err;
 		}
-		
+
 		const processError = await processAssignment(courseid, moduleid, assignment);
 		if (processError !== null) return processError;
+		await partialSave();
 	}
 	return null;
 }
 
-async function main() {
-	if (!canvas_token || !openrouter_key) throw new Error('Set CANVAS_TOKEN and OPENROUTER_API_KEY before syncing');
+export function canvasSync() {
+	if (syncing) {
+		return Promise.resolve("Already syncing");
+	}
+	activeSync = runCanvasSync();
+	return activeSync;
+}
+
+async function runCanvasSync() {
+	if (!openrouter_key) throw new Error('Set OPENROUTER_API_KEY before syncing');
+
+	syncing = true;
+	syncQueued = false;
+
 	page_set.clear();
 	assignment_set.clear();
 	quiz_set.clear();
 	files_set.clear();
 	external_set.clear();
 	discussion_set.clear();
-	
+
 	assignment_map.clear();
-	
-	let db_path = process.env.CANVAS_DB_PATH || path.join(cwd, "test_db.db");
-	console.log("Db at: "+db_path);
-	db.setDbPath(db_path);
-	let transactionStarted = false;
+
 	try {
-	await db.execute('BEGIN IMMEDIATE');
-	transactionStarted = true;
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Courses (
-		id TEXT PRIMARY KEY,
-		name TEXT,
-		uuid TEXT
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Modules (
-		id TEXT PRIMARY KEY,
-		name TEXT,
-		course_id TEXT
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Pages (
-		id TEXT PRIMARY KEY,
-		title TEXT,
-		updated_at TEXT,
-		html_url TEXT,
-		body TEXT,
-		course_id TEXT,
-		module_id TEXT
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Assignments (
-		id TEXT PRIMARY KEY,
-		name TEXT,
-		updated_at TEXT,
-		html_url TEXT,
-		description TEXT,
-		course_id TEXT,
-		module_id TEXT,
-		lock_at TEXT,
-		unlock_at TEXT,
-		due_at TEXT,
-		allowed_attempts INT,
-		points_possible INT,
-		grading_type TEXT,
-		has_submitted_submissions BOOL,
-		locked_for_user BOOL,
-		graded_submissions_exist BOOL,
-		is_quiz_assignment BOOL
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Quizzes (
-		id TEXT PRIMARY KEY,
-		title TEXT,
-		html_url TEXT,
-		description TEXT,
-		quiz_type TEXT,
-		scoring_policy TEXT,
-		allowed_attempts INT,
-		question_count INT,
-		points_possible INT,
-		due_at TEXT,
-		lock_at TEXT,
-		unlock_at TEXT,
-		published BOOL,
-		locked_for_user BOOL,
-		version_number INT,
-		course_id TEXT,
-		module_id TEXT
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Files (
-		id TEXT PRIMARY KEY,
-		display_name TEXT,
-		filename TEXT,
-		created_at TEXT,
-		updated_at TEXT,
-		unlock_at TEXT,
-		lock_at TEXT,
-		hidden_for_user BOOL,
-		locked_for_user BOOL,
-		modified_at TEXT,
-		mime_class TEXT,
-		course_id TEXT,
-		module_id TEXT,
-		url TEXT
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Externals (
-		id TEXT PRIMARY KEY,
-		title TEXT,
-		html_url TEXT,
-		course_id TEXT,
-		module_id TEXT
-	);`);
-	
-	await db.execute(`CREATE TABLE IF NOT EXISTS Discussions (
-		id TEXT PRIMARY KEY,
-		title TEXT,
-		created_at TEXT,
-		published BOOL,
-		locked_for_user BOOL,
-		html_url TEXT,
-		message TEXT,
-		todo_date TEXT,
-		course_id TEXT,
-		module_id TEXT
-	);`);
-	
-	// these are to be created by the language model
-	
-	// these will be removed when all DateFacts referencing this event disapears (id is a unique forever incrementing id)
-	await db.execute(`CREATE TABLE IF NOT EXISTS SavedEvents (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		course_id TEXT,
-		title TEXT,
-		description TEXT
-	);`);
-	
-	// this DateFacts came from "page/assignment/quiz/file/external/discussion" where id = from_id
-	// When said location is deleted, delete this datefact
-	// info is the specifics extracted by llm
-	// applies to SavedEvents WHERE id = applies_to
-	await db.execute(`CREATE TABLE IF NOT EXISTS DateFacts (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		from_type TEXT,
-		from_id TEXT,
-		course_id TEXT,
-		module_id TEXT,
-		date TEXT,
-		time TEXT,
-		info TEXT,
-		applies_to INTEGER
-	);`);
-	
-	// this CreationFacts came from "page/assignment/quiz/file/external/discussion" where id = from_id
-	// When said location is deleted, delete this CreationFacts
-	// info is the specifics extracted by llm
-	// applies to SavedEvents WHERE id = applies_to
-	await db.execute(`CREATE TABLE IF NOT EXISTS CreationFacts (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		from_type TEXT,
-		from_id TEXT,
-		course_id TEXT,
-		module_id TEXT,
-		info TEXT,
-		applies_to INTEGER
-	);`);
-	
-	let [courses, err] = await get_courses();
-	
-	if (err !== null) {
-		throw new Error(err);
-	}
-	
-	console.log("Syncing courses");
-	await syncCourses(courses);
-	
-	for (const course of courses) {
-		console.log(`Course... ${course.id}`);
-		
-		let err = await syncEvents(course);
-		
-		if (err !== null) {
-			throw new Error(err);
+		await start();
+		await db.execute('BEGIN IMMEDIATE');
+		syncTransactionStarted = true;
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Courses (
+			id TEXT PRIMARY KEY,
+			name TEXT,
+			uuid TEXT
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Modules (
+			id TEXT PRIMARY KEY,
+			name TEXT,
+			course_id TEXT
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Pages (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			updated_at TEXT,
+			html_url TEXT,
+			body TEXT,
+			course_id TEXT,
+			module_id TEXT
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Assignments (
+			id TEXT PRIMARY KEY,
+			name TEXT,
+			updated_at TEXT,
+			html_url TEXT,
+			description TEXT,
+			course_id TEXT,
+			module_id TEXT,
+			lock_at TEXT,
+			unlock_at TEXT,
+			due_at TEXT,
+			allowed_attempts INT,
+			points_possible INT,
+			grading_type TEXT,
+			is_quiz_assignment BOOL
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Quizzes (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			html_url TEXT,
+			description TEXT,
+			quiz_type TEXT,
+			scoring_policy TEXT,
+			allowed_attempts INT,
+			question_count INT,
+			points_possible INT,
+			due_at TEXT,
+			lock_at TEXT,
+			unlock_at TEXT,
+			published BOOL,
+			version_number INT,
+			course_id TEXT,
+			module_id TEXT
+		);`);
+
+		if (!(await db.query('PRAGMA table_info(Quizzes)')).some(column => column.name === 'assignment_id')) {
+			await db.execute('ALTER TABLE Quizzes ADD COLUMN assignment_id TEXT');
 		}
-		
-		err = await syncAssignments(course);
-		
-		if (err !== null) {
-			throw new Error(err);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Files (
+			id TEXT PRIMARY KEY,
+			display_name TEXT,
+			filename TEXT,
+			created_at TEXT,
+			updated_at TEXT,
+			unlock_at TEXT,
+			lock_at TEXT,
+			modified_at TEXT,
+			mime_class TEXT,
+			course_id TEXT,
+			module_id TEXT,
+			url TEXT
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Externals (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			html_url TEXT,
+			course_id TEXT,
+			module_id TEXT
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS Discussions (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			created_at TEXT,
+			published BOOL,
+			html_url TEXT,
+			message TEXT,
+			todo_date TEXT,
+			course_id TEXT,
+			module_id TEXT
+		);`);
+
+		// these are to be created by the language model
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS SavedEvents (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			course_id TEXT,
+			title TEXT,
+			description TEXT
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS DateFacts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			from_type TEXT,
+			from_id TEXT,
+			course_id TEXT,
+			module_id TEXT,
+			date TEXT,
+			time TEXT,
+			info TEXT,
+			applies_to INTEGER
+		);`);
+
+		await db.execute(`CREATE TABLE IF NOT EXISTS CreationFacts (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			from_type TEXT,
+			from_id TEXT,
+			course_id TEXT,
+			module_id TEXT,
+			info TEXT,
+			applies_to INTEGER
+		);`);
+		await partialSave();
+
+		const registrations = await withUserDb(() => user_db.query('SELECT DISTINCT course, token FROM TokenForCourses'));
+		const course_ids = new Set(registrations.map(r => r.course));
+
+		let courseAndToken = [];
+
+		for (const c_id of course_ids) {
+			const available = new Set(registrations.filter(r => r.course === c_id).map(r => r.token));
+
+			let works = [];
+
+			for (const avail of available) {
+				let [data, err, code] = await fetchData(base_url+`courses/${c_id}`, avail);
+
+				if (err == null) {
+					works.push(avail);
+				} else if (code == 401 || code == 403 || code == 404) {
+					// Remove this credential from the pool; remembered enrollment remains available.
+					await withUserDb(() => user_db.run('DELETE FROM TokenForCourses WHERE token = ? AND course = ?', [avail, c_id]));
+				} // Keep credentials after temporary network/server failures.
+			}
+
+			if (works.length == 0) { // no tokens for this course. We'll try again when we get another token for it.
+				continue;
+			}
+
+			const chosen = works[Math.floor(Math.random() * works.length)]; // choose a random working token
+			courseAndToken.push([c_id, chosen]);
 		}
-	}
-	
-	console.log("Ensure assignments");
-	const ensureError = await ensureAssignments();
-	if (ensureError !== null) throw new Error(ensureError);
-	console.log("Deleting unused entries");
-	
-	{
-		const existing = await db.query('SELECT * FROM Pages');
-		const existingIds = new Set(existing.map(r => r.id));
-		const goneNow = difference(existingIds, page_set);
-		
-		for (const p_id of goneNow) {
-			// delete this page id
-			await deletePageSaved(p_id);
+
+		const courseError = await syncCourses(courseAndToken);
+		if (courseError !== null) throw new Error(courseError);
+		await partialSave();
+		const syncedCourses = new Set(courseAndToken.map(([id]) => id));
+
+		for (const [course_id, canvas_token] of courseAndToken) {
+			console.log(`Course... ${course_id}`);
+
+			let err = await syncEvents(course_id, canvas_token);
+
+			if (err !== null) {
+				throw new Error(err);
+			}
+
+			err = await syncAssignments(course_id, canvas_token);
+
+			if (err !== null) {
+				throw new Error(err);
+			}
 		}
-	}
-	
-	{
-		const existing = await db.query('SELECT * FROM Assignments');
-		const existingIds = new Set(existing.map(r => r.id));
-		const goneNow = difference(existingIds, assignment_set);
-		
-		for (const a_id of goneNow) {
-			// delete this assignment id
-			await deleteAssignmentSaved(a_id);
+
+		console.log("Ensure assignments");
+		const ensureError = await ensureAssignments();
+		if (ensureError !== null) throw new Error(ensureError);
+		console.log("Deleting unused entries");
+
+		{
+			const existing = (await db.query('SELECT * FROM Pages')).filter(row => syncedCourses.has(row.course_id));
+			const existingIds = new Set(existing.map(r => r.id));
+			const goneNow = difference(existingIds, page_set);
+
+			for (const p_id of goneNow) {
+				// delete this page id
+				await deletePageSaved(p_id);
+			}
 		}
-	}
-	
-	{
-		const existing = await db.query('SELECT * FROM Quizzes');
-		const existingIds = new Set(existing.map(r => r.id));
-		const goneNow = difference(existingIds, quiz_set);
-		
-		for (const q_id of goneNow) {
-			// delete this quiz id
-			await deleteQuizSaved(q_id);
+
+		{
+			const existing = (await db.query('SELECT * FROM Assignments')).filter(row => syncedCourses.has(row.course_id));
+			const existingIds = new Set(existing.map(r => r.id));
+			const goneNow = difference(existingIds, assignment_set);
+
+			for (const a_id of goneNow) {
+				// delete this assignment id
+				await deleteAssignmentSaved(a_id);
+			}
 		}
-	}
-	
-	{
-		const existing = await db.query('SELECT * FROM Files');
-		const existingIds = new Set(existing.map(r => r.id));
-		const goneNow = difference(existingIds, files_set);
-		
-		for (const f_id of goneNow) {
-			// delete this file id
-			await deleteFileSaved(f_id);
+
+		{
+			const existing = (await db.query('SELECT * FROM Quizzes')).filter(row => syncedCourses.has(row.course_id));
+			const existingIds = new Set(existing.map(r => r.id));
+			const goneNow = difference(existingIds, quiz_set);
+
+			for (const q_id of goneNow) {
+				// delete this quiz id
+				await deleteQuizSaved(q_id);
+			}
 		}
-	}
-	
-	{
-		const existing = await db.query('SELECT * FROM Externals');
-		const existingIds = new Set(existing.map(r => r.id));
-		const goneNow = difference(existingIds, external_set);
-		
-		for (const e_id of goneNow) {
-			// delete this external id
-			await deleteExternalSaved(e_id);
+
+		{
+			const existing = (await db.query('SELECT * FROM Files')).filter(row => syncedCourses.has(row.course_id));
+			const existingIds = new Set(existing.map(r => r.id));
+			const goneNow = difference(existingIds, files_set);
+
+			for (const f_id of goneNow) {
+				// delete this file id
+				await deleteFileSaved(f_id);
+			}
 		}
-	}
-	
-	{
-		const existing = await db.query('SELECT * FROM Discussions');
-		const existingIds = new Set(existing.map(r => r.id));
-		const goneNow = difference(existingIds, discussion_set);
-		
-		for (const d_id of goneNow) {
-			// delete this discussion id
-			await deleteDiscussionSaved(d_id);
+
+		{
+			const existing = (await db.query('SELECT * FROM Externals')).filter(row => syncedCourses.has(row.course_id));
+			const existingIds = new Set(existing.map(r => r.id));
+			const goneNow = difference(existingIds, external_set);
+
+			for (const e_id of goneNow) {
+				// delete this external id
+				await deleteExternalSaved(e_id);
+			}
 		}
-	}
-	
-	// Now we need to identify all exsisting SavedEvents which no longer have an associated DateFact
-	
-	const existing_saved_events = new Set((await db.query('SELECT id FROM SavedEvents')).map(r => r.id));
-	const existing_references_dates = new Set((await db.query('SELECT applies_to FROM DateFacts')).map(r => r.applies_to));
-	const existing_references_creations = new Set((await db.query('SELECT applies_to FROM CreationFacts')).map(r => r.applies_to));
-	// find ones that no longer have references
-	
-	const all_refs = new Set([...existing_references_dates, ...existing_references_creations]);
-	const no_references = difference(existing_saved_events, all_refs);
-	
-	for (const event_id of no_references) {
-		// delete the saved event which no longer has any references
-		await db.run(`DELETE FROM SavedEvents WHERE id = ?`, [event_id]);
-	}
-	
-	await db.execute('COMMIT');
-	transactionStarted = false;
-	console.log("Done");
-	
+
+		{
+			const existing = (await db.query('SELECT * FROM Discussions')).filter(row => syncedCourses.has(row.course_id));
+			const existingIds = new Set(existing.map(r => r.id));
+			const goneNow = difference(existingIds, discussion_set);
+
+			for (const d_id of goneNow) {
+				// delete this discussion id
+				await deleteDiscussionSaved(d_id);
+			}
+		}
+
+		// Now we need to identify all exsisting SavedEvents which no longer have an associated DateFact
+
+		const existing_saved_events = new Set((await db.query('SELECT id, course_id FROM SavedEvents')).filter(r => syncedCourses.has(r.course_id)).map(r => r.id));
+		const existing_references_dates = new Set((await db.query('SELECT applies_to FROM DateFacts')).map(r => r.applies_to));
+		const existing_references_creations = new Set((await db.query('SELECT applies_to FROM CreationFacts')).map(r => r.applies_to));
+		// find ones that no longer have references
+
+		const all_refs = new Set([...existing_references_dates, ...existing_references_creations]);
+		const no_references = difference(existing_saved_events, all_refs);
+
+		for (const event_id of no_references) {
+			// delete the saved event which no longer has any references
+			await db.run(`DELETE FROM SavedEvents WHERE id = ?`, [event_id]);
+		}
+
+		await precomputeCourses(syncedCourses);
+		await db.execute('COMMIT');
+		syncTransactionStarted = false;
+		console.log("Done");
+
 	} catch (error) {
-		if (transactionStarted) await db.execute('ROLLBACK');
+		if (syncTransactionStarted) await db.execute('ROLLBACK');
 		throw error;
 	} finally {
-		await db.close();
+		syncTransactionStarted = false;
+		try {
+			await db.close();
+		} finally {
+			syncing = false;
+			scheduleQueuedSync();
+		}
 	}
 }
 
-export { main, fetchData, fetchModelResponse, createPrompt, updateSavedEvents,
-	formatCanvasDate, extractFileText, processPage, processAssignment, processQuiz,
-	processFile, processDiscussion, syncCourses, syncEvents, syncAssignments, ensureAssignments };
-
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-	main().catch(error => {
-		console.error(error.message);
-		process.exitCode = 1;
+// User registration transactions are serialized because requests can overlap.
+export function start() {
+	if (!initialization) initialization = initialize().catch(error => {
+		initialization = undefined;
+		throw error;
 	});
+	return initialization;
 }
+
+async function initialize() {
+	await withUserDb(async () => {
+		for (const table of ['TokenForCourses', 'TokenToCourses']) {
+			await user_db.execute(`CREATE TABLE IF NOT EXISTS ${table} (
+				id INTEGER PRIMARY KEY AUTOINCREMENT, course TEXT, token TEXT
+			);`);
+			await user_db.run(`DELETE FROM ${table} WHERE id NOT IN (
+				SELECT MIN(id) FROM ${table} GROUP BY course, token
+			)`);
+			await user_db.execute(`CREATE UNIQUE INDEX IF NOT EXISTS ${table}_course_token ON ${table}(course, token)`);
+		}
+	});
+	await cache_db.execute(`CREATE TABLE IF NOT EXISTS CourseSnapshots (
+		course_id TEXT PRIMARY KEY, last_update INTEGER NOT NULL, payload TEXT NOT NULL
+	);`);
+}
+
+export async function stop() {
+	syncQueued = false;
+	if (queuedSyncHandle) clearImmediate(queuedSyncHandle);
+	queuedSyncHandle = undefined;
+	if (activeSync) await activeSync.catch(() => {});
+	await userDbQueue;
+	await user_db.close();
+	await cache_db.close();
+	initialization = undefined;
+}
+
+/** Return { token_good, started_index_of_course, courses: CourseSnapshot[] }.
+ * Unindexed courses queue background work after the response has been built.
+ * Each snapshot contains course_id, course_name, last_update (Unix milliseconds,
+ * or -1 before its first sync), events with dates/creation_facts/source links,
+ * modules and six source arrays. Clients fetch api_url/submission_url with their
+ * own Canvas token for personal deadlines, access and submission status.
+ */
+export async function getClientSync(canvas_token) {
+	if (typeof canvas_token !== 'string' || !canvas_token.trim()) throw new Error('Canvas token is required');
+	await start();
+	const [courses, err, code] = await fetchData('courses', canvas_token);
+	if (err == null && !Array.isArray(courses)) throw new Error('Expected a Canvas course list');
+	const courseIds = await withUserDb(async () => {
+		await user_db.execute('BEGIN IMMEDIATE');
+		try {
+			let ids;
+			if (err != null) {
+				ids = (await user_db.query('SELECT course FROM TokenToCourses WHERE token = ? ORDER BY id', [canvas_token])).map(row => row.course);
+				// A temporary outage should not discard usable credentials.
+				if (code === 401 || code === 403) await user_db.run('DELETE FROM TokenForCourses WHERE token = ?', [canvas_token]);
+			} else {
+				ids = [...new Set(courses.filter(course => course.id != null).map(course => String(course.id)))];
+				await user_db.run('DELETE FROM TokenForCourses WHERE token = ?', [canvas_token]);
+				await user_db.run('DELETE FROM TokenToCourses WHERE token = ?', [canvas_token]);
+				for (const id of ids) {
+					await user_db.run('INSERT INTO TokenToCourses (token, course) VALUES (?, ?)', [canvas_token, id]);
+					await user_db.run('INSERT INTO TokenForCourses (course, token) VALUES (?, ?)', [id, canvas_token]);
+				}
+			}
+			await user_db.execute('COMMIT');
+			return ids;
+		} catch (error) {
+			await user_db.execute('ROLLBACK');
+			throw error;
+		}
+	});
+	const snapshots = new Map((courseIds.length ? await cache_db.query(
+		`SELECT course_id, payload FROM CourseSnapshots WHERE course_id IN (${courseIds.map(() => '?').join(',')})`, courseIds) : []
+	).map(row => [row.course_id, row.payload]));
+	const names = new Map((courses ?? []).map(course => [course.id, course.original_name ?? course.name]));
+	const courseData = courseIds.map(id => snapshots.has(id) ? JSON.parse(snapshots.get(id)) : emptyCourse(id, names.get(id)));
+	const startedIndex = courseData.some(course => course.last_update === -1);
+	const response = {
+		token_good: err == null,
+		started_index_of_course: startedIndex,
+		courses: courseData
+	};
+	if (startedIndex) queueCanvasSync();
+	return response;
+}
+
+function emptyCourse(id, name = null) {
+	return { course_id: id, course_name: name, last_update: -1,
+		modules: [], events: [], assignments: [], quizzes: [], pages: [], files: [], externals: [], discussions: [] };
+}
+
+// Only explicitly selected shared columns are published. Credentials, submission
+// state, per-user locks and signed download URLs never enter the shared blob.
+const courseSources = [
+	['Assignments', 'assignments', 'assignment', 'id, name, updated_at, html_url, description, course_id, module_id, lock_at, unlock_at, due_at, allowed_attempts, points_possible, grading_type, is_quiz_assignment'],
+	['Quizzes', 'quizzes', 'quiz', 'id, assignment_id, title, html_url, description, quiz_type, scoring_policy, allowed_attempts, question_count, points_possible, due_at, lock_at, unlock_at, published, version_number, course_id, module_id'],
+	['Pages', 'pages', 'page', 'id, title, updated_at, html_url, body, course_id, module_id'],
+	['Files', 'files', 'file', 'id, display_name, filename, created_at, updated_at, unlock_at, lock_at, mime_class, course_id, module_id'],
+	['Externals', 'externals', 'external', 'id, title, html_url, course_id, module_id'],
+	['Discussions', 'discussions', 'discussion', 'id, title, created_at, published, html_url, message, todo_date, course_id, module_id']
+];
+
+async function precomputeCourses(courseIds) {
+	const lastUpdate = Date.now(); // Unix milliseconds; -1 is reserved for never synced.
+	for (const courseId of courseIds) {
+		const [course] = await db.query('SELECT * FROM Courses WHERE id = ?', [courseId]);
+		const payload = emptyCourse(courseId, course.name);
+		
+		payload.uuid = course.uuid;
+		payload.last_update = lastUpdate;
+		payload.modules = await db.query('SELECT * FROM Modules WHERE course_id = ? ORDER BY id', [courseId]);
+		
+		const sources = new Map();
+		
+		for (const [table, key, type, columns] of courseSources) {
+			payload[key] = (await db.query(`SELECT ${columns} FROM ${table} WHERE course_id = ? ORDER BY id`, [courseId])).map(row => {
+				const coursePath = `courses/${encodeURIComponent(courseId)}`;
+				const resource = type === 'discussion' ? 'discussion_topics' : key;
+				const apiUrl = type === 'external' ? null : new URL(type === 'file' ? `files/${encodeURIComponent(row.id)}` : `${coursePath}/${resource}/${encodeURIComponent(row.id)}`, base_url).href;
+				const item = { ...row, api_url: apiUrl };
+				
+				if (type === 'assignment') item.submission_url = new URL(`${coursePath}/assignments/${encodeURIComponent(row.id)}/submissions/self`, base_url).href;
+				if (type === 'quiz') item.submission_url = new URL(`${coursePath}/quizzes/${encodeURIComponent(row.id)}/submission`, base_url).href;
+				sources.set(`${type}:${row.id}`, item);
+				return item;
+			});
+		}
+		
+		const dates = await db.query('SELECT * FROM DateFacts WHERE course_id = ? ORDER BY id', [courseId]);
+		const creations = await db.query('SELECT * FROM CreationFacts WHERE course_id = ? ORDER BY id', [courseId]);
+		
+		payload.events = (await db.query('SELECT * FROM SavedEvents WHERE course_id = ? ORDER BY id', [courseId])).map(event => {
+			const eventDates = dates.filter(fact => fact.applies_to === event.id);
+			const eventCreations = creations.filter(fact => fact.applies_to === event.id);
+			
+			const refs = new Map([...eventDates, ...eventCreations].map(fact => {
+				const key = `${fact.from_type}:${fact.from_id}`;
+				const source = sources.get(key);
+				return [key, { type: fact.from_type, id: fact.from_id, course_id: courseId, module_id: fact.module_id,
+					api_url: source?.api_url ?? null, html_url: source?.html_url ?? null, submission_url: source?.submission_url ?? null }];
+			}));
+			return { ...event, dates: eventDates, creation_facts: eventCreations, sources: [...refs.values()] };
+		});
+		
+		await db.run(`INSERT INTO CourseSnapshots (course_id, last_update, payload) VALUES (?, ?, ?)
+			ON CONFLICT(course_id) DO UPDATE SET last_update = excluded.last_update, payload = excluded.payload`,
+			[courseId, lastUpdate, JSON.stringify(payload)]);
+	}
+}
+
+export { fetchData, extractFileText, formatCanvasDate, updateSavedEvents };
