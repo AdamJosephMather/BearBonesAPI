@@ -1,5 +1,0 @@
-{
-  "dependencies": {
-    "@capacitor-community/sqlite": "^8.1.1"
-  }
-}

@@ -295,7 +295,8 @@ The output schema will be:
 				{
 					"title":STRING,
 					"date":STRING,
-					"time":STRING
+					"time":STRING,
+					"show":BOOL
 				}
 			]
 		}
@@ -305,7 +306,8 @@ The output schema will be:
 			"event_id":INT,
 			"title":STRING,
 			"date":STRING,
-			"time":STRING
+			"time":STRING,
+			"show":BOOL
 		}
 	]
 }
@@ -313,9 +315,27 @@ The output schema will be:
 Individual events (quizes, assignments, midterms, social events, any) should be individual events in our system. Each event can have multiple dates. For instance, an assignment can have an open date, a close date, maybe other dates between. They do not however, have to have multiple dates.
 
 An event's title is a short few word item to glance at. For instance: 'Midterm 1' or 'Quiz on Modules 3-4'.
+
 The description for an event should be a *short* summary. Ideally one sentence, maybe two if needed.
+
 The title for a date is the short title indicating that date's significance. For instance, "Due date" or "Assignment open". It can also be the name of the event if the event is singular. Ie, a midterm will likely have only one date with "Midterm" as the date's title and the event's title.
+
+The \`show\` field determines whether a date should appear on the user's calendar. Set it to \`true\` for dates representing an actionable deadline, scheduled activity, or event that a student would reasonably want to plan around.
+
+- \`true\`: Assignment due dates, quizzes, exams, midterms, project deadlines, meetings, scheduled review sessions, presentations, and other time-sensitive commitments.
+- \`false\`: Assignment unlock dates, content publication dates, availability windows, routine office hours, and administrative dates that do not require action.
+
+A lock or close date should be shown if it represents the effective submission deadline and no separate due date is provided, otherwise, hide.
+
+When uncertain, prefer \`false\` for passive availability changes and \`true\` for dates requiring the student to complete something, attend something, or be somewhere at a particular time.
+
+Record relevant dates even when \`show\` is \`false\`; the field only controls calendar visibility, not whether the date is stored.
+
+The event_id in additions is for the event for which an additional date has been discovered.
+
 Do not create a duplicate of an event we've already captured.
+
+Do not record lectures or similar repeating events. Your job is to help keep track of dates, not to flood the user's calendar with junk.
 
 # Existing Events:
 
@@ -359,7 +379,8 @@ async function updateSavedEvents(res, from_type, from_id, course_id, module_id) 
 		// Validate the entire response before inserting any facts.
 		for (const event of newEvents) {
 			if (!event || typeof event.title !== 'string' || !event.title.trim() ||
-				typeof event.description !== 'string' || !Array.isArray(event.dates ?? [])) {
+				typeof event.description !== 'string' ||
+				typeof event.show !== 'boolean' || !Array.isArray(event.dates ?? [])) {
 				return 'Invalid new event in AI response';
 			}
 			for (const fact of event.dates ?? []) validateDateFact(fact);
@@ -387,8 +408,8 @@ async function updateSavedEvents(res, from_type, from_id, course_id, module_id) 
 			}
 			for (const fact of facts) {
 				await db.run(
-					'INSERT INTO DateFacts (from_type, from_id, course_id, module_id, date, time, info, applies_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-					[from_type, from_id, course_id, module_id, fact.date, fact.time || null, fact.title, fact.event_id]);
+					'INSERT INTO DateFacts (from_type, from_id, course_id, module_id, date, time, info, applies_to, show) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+					[from_type, from_id, course_id, module_id, fact.date, fact.time || null, fact.title, fact.event_id, fact.show]);
 			}
 			await db.execute('RELEASE model_events');
 		} catch (error) {
@@ -1208,7 +1229,8 @@ async function runCanvasSync() {
 			date TEXT,
 			time TEXT,
 			info TEXT,
-			applies_to INTEGER
+			applies_to INTEGER,
+			show BOOL
 		);`);
 
 		await db.execute(`CREATE TABLE IF NOT EXISTS CreationFacts (
@@ -1482,6 +1504,8 @@ const courseSources = [
 ];
 
 async function precomputeCourses(courseIds) {
+	console.log(`Precomputing ${courseIds.length} courses`);
+	
 	const lastUpdate = Date.now(); // Unix milliseconds; -1 is reserved for never synced.
 	for (const courseId of courseIds) {
 		const [course] = await db.query('SELECT * FROM Courses WHERE id = ?', [courseId]);
@@ -1518,7 +1542,8 @@ async function precomputeCourses(courseIds) {
 				const key = `${fact.from_type}:${fact.from_id}`;
 				const source = sources.get(key);
 				return [key, { type: fact.from_type, id: fact.from_id, course_id: courseId, module_id: fact.module_id,
-					api_url: source?.api_url ?? null, html_url: source?.html_url ?? null, submission_url: source?.submission_url ?? null }];
+					api_url: source?.api_url ?? null, html_url: source?.html_url ?? null,
+					submission_url: source?.submission_url ?? null, show: fact?.show ?? false }];
 			}));
 			return { ...event, dates: eventDates, creation_facts: eventCreations, sources: [...refs.values()] };
 		});
