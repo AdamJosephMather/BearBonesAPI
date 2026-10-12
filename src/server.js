@@ -15,7 +15,7 @@ app.use(express.json())
 
 // --- CONFIGURATION ---
 const DUCK_DOMAIN        = 'bearbones';
-const SERVER_INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
+const SERVER_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const SYNC_INTERVAL_MS   = 4 * 60 * 60 * 1000; // 4 hours
 
 // Metadata tracking object
