@@ -1504,7 +1504,7 @@ const courseSources = [
 ];
 
 async function precomputeCourses(courseIds) {
-	console.log(`Precomputing ${courseIds.length} courses`);
+	console.log(`Precomputing ${courseIds.size} courses`);
 	
 	const lastUpdate = Date.now(); // Unix milliseconds; -1 is reserved for never synced.
 	for (const courseId of courseIds) {
