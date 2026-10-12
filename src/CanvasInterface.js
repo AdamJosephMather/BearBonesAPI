@@ -114,24 +114,31 @@ async function extractFileText(buffer, filename) {
 	return [text, null];
 }
 
-async function downloadIntoMemory(url) {
+async function downloadIntoMemory(url, canvas_token) {
 	try {
-		const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
-		if (!response.ok) {
-			return [null, `HTTP error! Status: ${response.status}`];
+		const target = new URL(url);
+		const headers = {};
+
+		if (canvas_token && target.origin === new URL(base_url).origin) {
+			headers.Authorization = `Bearer ${canvas_token}`;
 		}
-		return [Buffer.from(await response.arrayBuffer()), null];
+
+		const response = await fetch(target, {
+			headers,
+			signal: AbortSignal.timeout(60_000)
+		});
+
+		if (!response.ok) {
+			return [null, `HTTP error! Status: ${response.status}`, response.status];
+		}
+
+		return [Buffer.from(await response.arrayBuffer()), null, response.status];
 	} catch (error) {
-		return [null, `Failed to download file into memory: ${error}`];
+		return [null, `Failed to download file into memory: ${error}`, null];
 	}
 }
 
 async function fetchModelResponse(prompt) {
-//	console.log("Prompt:");
-//	console.log(prompt);
-//	console.log("Waiting until enter to run AI.");
-//	await waitUntilEnter();
-
 	const url = openrouter_url + 'chat/completions';
 	try {
 		const response = await fetch(url, {
@@ -335,7 +342,7 @@ The event_id in additions is for the event for which an additional date has been
 
 Do not create a duplicate of an event we've already captured.
 
-Do not record lectures or similar repeating events. Your job is to help keep track of dates, not to flood the user's calendar with junk.
+Do not record lectures or similar repeating events. Your job is to help keep track of dates, not to flood the user's calendar with garbage.
 
 # Existing Events:
 
@@ -349,7 +356,7 @@ ${prompt_addition}`;
 }
 
 function validateDateFact(fact) {
-	if (!fact || typeof fact.title !== 'string' || !fact.title.trim() ||
+	if (!fact || typeof fact.show !== 'boolean' || typeof fact.title !== 'string' || !fact.title.trim() ||
 		typeof fact.date !== 'string' || !/^\d{2}\/\d{2}\/\d{4}$/.test(fact.date)) {
 		throw new Error('Invalid date fact in AI response');
 	}
@@ -379,8 +386,7 @@ async function updateSavedEvents(res, from_type, from_id, course_id, module_id) 
 		// Validate the entire response before inserting any facts.
 		for (const event of newEvents) {
 			if (!event || typeof event.title !== 'string' || !event.title.trim() ||
-				typeof event.description !== 'string' ||
-				typeof event.show !== 'boolean' || !Array.isArray(event.dates ?? [])) {
+				typeof event.description !== 'string' || !Array.isArray(event.dates ?? [])) {
 				return 'Invalid new event in AI response';
 			}
 			for (const fact of event.dates ?? []) validateDateFact(fact);
@@ -520,7 +526,109 @@ async function updateSourceLocation(table, type, id, course_id, module_id) {
 	}
 }
 
-async function processPage(course_id, module_id, page, err, code) {
+async function getPageFile(page_course_id, module_id, page_id, file_course_id, file_id, canvas_token, updated_at) {
+	let [file, err, code] = await fetchData(base_url+`courses/${file_course_id}/files/${file_id}`, canvas_token);
+
+	if (err !== null && (code == 404 || code == 403 || code == 401)) {
+		return null; // whatever, we're not allowed to see it... :(
+	}else if (err !== null) {
+		return err;
+	}
+	
+	let file_data;
+	const [buffer, dlErr, filecode] = await downloadIntoMemory(file.url, canvas_token);
+	if (dlErr !== null) {
+		if (filecode == 403 || filecode == 401) {
+			return null;
+		}
+		return dlErr;
+	}
+
+	const [text, extractErr] = await extractFileText(buffer, file.filename);
+	if (extractErr !== null) {
+		return null; // couldn't extract data, pack it up, go home
+	} else {
+		file_data = text;
+	}
+
+	const prompt = await createPrompt(page_course_id, module_id, `# File:
+
+Last updated at: ${updated_at}
+
+Filename: ${file.filename}
+File: ${file_data}
+`);
+	let [res, err2] = await fetchModelResponse(prompt);
+	
+	console.log("Extracted file from page.");
+
+	if (err2 != null) {
+		return err2;
+	}
+
+	err2 = await updateSavedEvents(res, "page", page_id, page_course_id, module_id);
+
+	if (err2 != null) {
+		return err2;
+	}
+}
+
+function extractFilesLinks(content) {
+	const regex = /courses\/(\d+)\/files\/(\d+)/g;
+	let match;
+	const seen = new Set();
+	const results = [];
+	
+	while ((match = regex.exec(content)) !== null) {
+		const courseId = match[1];
+		const fileId = match[2];
+		const uniqueKey = `${courseId}-${fileId}`;
+	
+		// Check if we've already recorded this unique file/course pair
+		if (!seen.has(uniqueKey)) {
+			seen.add(uniqueKey);
+			results.push([ courseId, fileId ]);
+		}
+	}
+	
+	return results;
+}
+
+function searchKeywords(text) {
+	if (typeof text !== 'string' || !text.trim()) return false;
+
+	// Search visible source text, not URLs, HTML attributes, or the full AI prompt.
+	// Keep this broad: a false positive costs a request; a false negative loses a date.
+	const content = text
+		.replace(/<!--[\s\S]*?-->/g, ' ')
+		.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
+		.replace(/<[^>]*>/g, ' ')
+		.replace(/https?:\/\/[^\s<>]+|\/(?:api\/v1\/)?(?:courses\/\d+\/)?files\/[^\s<>]+/gi, ' ')
+		.replace(/&#(x[0-9a-f]+|\d+);/gi, (entity, code) => {
+			const value = code[0].toLowerCase() === 'x' ? parseInt(code.slice(1), 16) : Number(code);
+			return value <= 0x10ffff ? String.fromCodePoint(value) : entity;
+		})
+		.replace(/&(?:nbsp|ensp|emsp|thinsp);/gi, ' ')
+		.replace(/&sol;/gi, '/')
+		.replace(/&colon;/gi, ':');
+
+	return [
+		// Full names and common abbreviations, with boundaries to avoid "summary"/"maybe".
+		/\b(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/i,
+		/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i,
+		// Numeric dates, including ISO dates and dates without a year.
+		/\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?=T|\b)|\b\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2,4})?\b/i,
+		/\b(?:today|tonight|tomorrow|yesterday|noon|midnight|daily|weekly|monthly|fortnight)\b/i,
+		/\b(?:this|next|last|coming|following|every|each)\s+(?:day|week|weekend|month|year|morning|afternoon|evening|night)\b/i,
+		/\b(?:in|within|after|before)\s+(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|couple\s+of)\s+(?:hours?|days?|weeks?|months?)\b/i,
+		/\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b(?:1[0-2]|0?[1-9])\s*(?:a\.?m\.?|p\.?m\.?)\b/i,
+		// Dates can be implied by surrounding course context rather than spelled out.
+		/\b(?:due|deadlines?|exam(?:ination)?s?|midterms?|quizz?es|quiz|tests?|meetings?|appointments?|presentations?|submissions?|submit|scheduled?|schedules?)\b/i,
+		/\b\d{1,2}(?:st|nd|rd|th)\b/i
+	].some(pattern => pattern.test(content));
+}
+
+async function processPage(course_id, module_id, page, err, code, canvas_token) {
 	if (err !== null) {
 		if (code == 404) {
 			return null; // we're going to claim that 404 means 'it does not exist' as was the case with a discussion item
@@ -542,24 +650,38 @@ async function processPage(course_id, module_id, page, err, code) {
 
 	if (deleted || existing.length === 0) {
 		console.log("Added page "+page.title);
-
-		const prompt = await createPrompt(course_id, module_id, `# Page:
+		
+		let needsEval = searchKeywords(page.title+" "+page.body);
+		
+		if (needsEval) {
+			const prompt = await createPrompt(course_id, module_id, `# Page:
 
 Updated Last at: ${formatCanvasDate(page.updated_at)}
 
 Title: ${page.title}
 Body: ${page.body}
 `);
-		let [res, err] = await fetchModelResponse(prompt);
-
-		if (err != null) {
-			return err;
+			let [res, err] = await fetchModelResponse(prompt);
+	
+			if (err != null) {
+				return err;
+			}
+	
+			err = await updateSavedEvents(res, "page", page.page_id, course_id, module_id);
+	
+			if (err != null) {
+				return err;
+			}
+		}else{
+			console.log("skip");
 		}
-
-		err = await updateSavedEvents(res, "page", page.page_id, course_id, module_id);
-
-		if (err != null) {
-			return err;
+		
+		const files = extractFilesLinks(page.body);
+		for (const [c_id, f_id] of files) {
+			let err = await getPageFile(course_id, module_id, page.page_id, c_id, f_id, canvas_token, formatCanvasDate(page.updated_at));
+			if (err != null) {
+				return err;
+			}
 		}
 
 		await db.run(
@@ -745,7 +867,7 @@ Description: ${quiz.description}
 	return null;
 }
 
-async function processFile(course_id, module_id, item, file, err, code) {
+async function processFile(course_id, module_id, item, file, err, code, canvas_token) {
 	if (err !== null) {
 		if (code == 404) {
 			return null;
@@ -769,8 +891,10 @@ async function processFile(course_id, module_id, item, file, err, code) {
 		console.log("Added file "+file.display_name);
 
 		let file_data;
-		const [buffer, dlErr] = await downloadIntoMemory(file.url);
-		if (dlErr !== null) {
+		const [buffer, dlErr, filecode] = await downloadIntoMemory(file.url, canvas_token);
+		if (dlErr != null && filecode == 403 || filecode == 401) {
+			return null;
+		}else if (dlErr != null) {
 			return dlErr;
 		}
 
@@ -959,7 +1083,7 @@ async function processEvent(course_id, module_id, item, canvas_token) {
 		return await processExternal(course_id, module_id, item);
 	}else if (item.type === "Page") {
 		let [item_specifics, err, code] = await fetchData(item.url, canvas_token);
-		return await processPage(course_id, module_id, item_specifics, err, code);
+		return await processPage(course_id, module_id, item_specifics, err, code, canvas_token);
 	}else if (item.type === "Assignment") {
 		// we bulk search assignments
 		assignment_map.set(item.content_id, [course_id, module_id, canvas_token])
@@ -985,7 +1109,7 @@ async function processEvent(course_id, module_id, item, canvas_token) {
 			return null; // already handled
 		}
 		let [item_specifics, err, code] = await fetchData(item.url, canvas_token);
-		return await processFile(course_id, module_id, item, item_specifics, err, code);
+		return await processFile(course_id, module_id, item, item_specifics, err, code, canvas_token);
 	}else{
 		return `Missing type of ModuleItem (${item.type})`;
 	}
@@ -1554,4 +1678,4 @@ async function precomputeCourses(courseIds) {
 	}
 }
 
-export { fetchData, extractFileText, formatCanvasDate, updateSavedEvents };
+export { fetchData, extractFileText, formatCanvasDate, updateSavedEvents, searchKeywords };
