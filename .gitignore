@@ -1,5 +1,6 @@
 secrets.js
 secrets.py
+__pycache__/
 node_modules/
 *.db
 *.db-journal
