@@ -2,9 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import https from 'https';
-import tls from 'tls';
 import express from 'express';
-import { DUCK_TOKEN, openrouter_key } from './secrets.js';
+import { DUCK_TOKEN } from './secrets.js';
 import * as canvas_interface from './CanvasInterface.js'
 
 const app = express();
@@ -68,7 +67,8 @@ function loadInitialCerts() {
 	return {
 		key: fs.readFileSync(paths.key),
 		cert: fs.readFileSync(paths.cert),
-		mtime: fs.statSync(paths.key).mtimeMs
+		mtime: fs.statSync(paths.key).mtimeMs,
+		certMtime: fs.statSync(paths.cert).mtimeMs
 	};
 }
 
@@ -88,6 +88,7 @@ const server = https.createServer({
 }, app);
 
 let lastKeyMtime = certData.mtime;
+let lastCertMtime = certData.certMtime;
 
 // --- ROUTES ---
 app.get('/', (req, res) => {
@@ -113,15 +114,15 @@ app.get('/', (req, res) => {
 
 // 1. /sync endpoint (accepts token as string, returns JSON)
 app.post('/sync', async (req, res) => {
-	const { token } = req.body;
+	const { token } = req.body ?? {};
 
 	// Basic validation to ensure a token was provided
-	if (!token) {
+	if (typeof token !== 'string' || !token.trim()) {
 		return res.status(400).json({ error: 'Token is required' });
 	}
 
 	// TODO: Add your logic to verify the token here
-	console.log(`[API] Received sync request with token: ${token}`);
+	console.log('[API] Received sync request');
 	
 	let output = await canvas_interface.getClientSync(token);
 	
@@ -175,17 +176,18 @@ async function backgroundTask() {
 		serverState.lastCertCheck = new Date().toISOString();
 		const paths = findCertPaths();
 		const keyStat = fs.statSync(paths.key);
+		const certStat = fs.statSync(paths.cert);
 
-		if (keyStat.mtimeMs !== lastKeyMtime) {
+		if (keyStat.mtimeMs !== lastKeyMtime || certStat.mtimeMs !== lastCertMtime) {
 			console.log('[SSL] New certificate modification detected. Hot-swapping...');
 			
-			const newContext = tls.createSecureContext({
+			server.setSecureContext({
 				key: fs.readFileSync(paths.key),
 				cert: fs.readFileSync(paths.cert)
 			});
 			
-			server.setSecureContext(newContext);
 			lastKeyMtime = keyStat.mtimeMs;
+			lastCertMtime = certStat.mtimeMs;
 			serverState.certReloadCount++;
 			console.log('[SSL] Certificates successfully reloaded live without restart.');
 		}
@@ -195,14 +197,18 @@ async function backgroundTask() {
 }
 
 async function syncToCanvas() {
-	await canvas_interface.canvasSync();
+	try {
+		await canvas_interface.canvasSync();
+	} catch (err) {
+		console.error('Background Canvas sync failed:', err.message);
+	}
 }
 
 // Start interval loop
 setInterval(backgroundTask, SERVER_INTERVAL_MS);
 
 await canvas_interface.start();
-await syncToCanvas();
+void syncToCanvas();
 
 setInterval(syncToCanvas, SYNC_INTERVAL_MS); // does not start until 4 hours from now.
 

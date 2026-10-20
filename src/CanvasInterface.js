@@ -116,7 +116,13 @@ async function extractFileText(buffer, filename) {
 
 async function downloadIntoMemory(url, canvas_token) {
 	try {
-		const target = new URL(url);
+		if (typeof url !== 'string' || !url.trim()) {
+			throw new Error('Canvas file has no download URL');
+		}
+		const target = new URL(url, base_url);
+		if (!['https:', 'http:'].includes(target.protocol)) {
+			throw new Error('Canvas file download URL must use HTTP or HTTPS');
+		}
 		const headers = {};
 
 		if (canvas_token && target.origin === new URL(base_url).origin) {
@@ -223,6 +229,12 @@ function normalizeCanvasIds(value) {
 				? String(item) : normalizeCanvasIds(item)]));
 	}
 	return value;
+}
+
+function fileUnavailable(file) {
+	// Canvas can return metadata without a download URL for restricted files.
+	return file.locked_for_user || file.hidden_for_user ||
+		typeof file.url !== 'string' || !file.url.trim();
 }
 
 async function createPrompt(course_id, module_id, prompt_addition) {
@@ -534,6 +546,7 @@ async function getPageFile(page_course_id, module_id, page_id, file_course_id, f
 	}else if (err !== null) {
 		return err;
 	}
+	if (fileUnavailable(file)) return null;
 	
 	let file_data;
 	const [buffer, dlErr, filecode] = await downloadIntoMemory(file.url, canvas_token);
@@ -874,6 +887,7 @@ async function processFile(course_id, module_id, item, file, err, code, canvas_t
 		}
 		return err;
 	}
+	if (fileUnavailable(file)) return null;
 
 	if (files_set.has(file.id)) { // content_id
 		return null;
@@ -892,7 +906,7 @@ async function processFile(course_id, module_id, item, file, err, code, canvas_t
 
 		let file_data;
 		const [buffer, dlErr, filecode] = await downloadIntoMemory(file.url, canvas_token);
-		if (dlErr != null && filecode == 403 || filecode == 401) {
+		if (dlErr != null && (filecode == 403 || filecode == 401)) {
 			return null;
 		}else if (dlErr != null) {
 			return dlErr;
