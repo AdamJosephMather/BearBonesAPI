@@ -12,6 +12,7 @@
     "check": "node --check CanvasInterface.js && node --check db/node-adapter.js"
   },
   "dependencies": {
+    "cors": "^2.8.6",
     "express": "^5.3.0",
     "mammoth": "1.13.0",
     "officeparser": "8.1.1",

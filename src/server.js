@@ -3,11 +3,26 @@ import path from 'path';
 import os from 'os';
 import https from 'https';
 import express from 'express';
+import cors from 'cors';
 import { DUCK_TOKEN } from './secrets.js';
 import * as canvas_interface from './CanvasInterface.js'
 
 const app = express();
 const PORT = 3982;
+
+//const allowedOrigins = ['https://yourfrontend.com', 'http://localhost:3000'];
+//
+//app.use(cors({
+//	origin: allowedOrigins,
+//	methods: ['POST', 'OPTIONS'],
+//	allowedHeaders: ['Content-Type']
+//}));
+
+app.use(cors({
+	origin: '*',
+	methods: ['POST', 'OPTIONS'],
+	allowedHeaders: ['Content-Type']
+}));
 
 // For json in/out
 app.use(express.json())
