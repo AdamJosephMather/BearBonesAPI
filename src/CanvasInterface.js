@@ -1,12 +1,24 @@
 import { DatabaseManager } from './db/node-adapter.js';
 import path from 'node:path'
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const cwd = process.cwd();
 
 let canvas_db_path = process.env.CANVAS_DB_PATH || path.join(cwd, "canvas_db.db");
 let user_db_path = process.env.USER_DB_PATH || path.join(cwd, "user_db.db");
 
-const db = new DatabaseManager(canvas_db_path);
+// Keep short database critical sections exclusive, while network/AI work overlaps.
+const syncDb = new DatabaseManager(canvas_db_path);
+const dbLock = new AsyncLocalStorage();
+let dbQueue = Promise.resolve();
+function withSyncDb(operation) {
+	if (dbLock.getStore()) return operation();
+	const result = dbQueue.then(() => dbLock.run(true, operation));
+	dbQueue = result.catch(() => {});
+	return result;
+}
+const db = Object.fromEntries(['execute', 'run', 'query', 'close'].map(method =>
+	[method, (...args) => withSyncDb(() => syncDb[method](...args))]));
 const user_db = new DatabaseManager(user_db_path);
 // A separate connection only sees published, committed course snapshots.
 const cache_db = new DatabaseManager(canvas_db_path);
@@ -18,16 +30,28 @@ function withUserDb(operation) {
 	return result;
 }
 
-// These sets are to be reset on each sync. They will keep track of already indexed files, and also will tell us which files we have not seen this search, so that we can rid ourselves of them when we're done
-const page_set       = new Set();
-const assignment_set = new Set();
-const quiz_set       = new Set();
-const files_set      = new Set();
-const external_set   = new Set();
-const discussion_set = new Set();
+// Each course keeps its own discovery/deduplication state.
+const courseContext = new AsyncLocalStorage();
+function newCourseState() {
+	return {
+		page_set: new Set(), assignment_set: new Set(), quiz_set: new Set(),
+		files_set: new Set(), external_set: new Set(), discussion_set: new Set(),
+		assignment_map: new Map()
+	};
+}
 
-// this will store assignment ids and associate them with the module they came from. This is so that we don't have to do individual searches per assignment, and rather the bulk search just once
-const assignment_map = new Map();
+// Hold a credential until the entire response body has been consumed.
+const canvasRequests = new Map();
+async function withCanvasKey(token, operation) {
+	const previous = canvasRequests.get(token) ?? Promise.resolve();
+	const result = previous.catch(() => {}).then(operation);
+	canvasRequests.set(token, result);
+	try {
+		return await result;
+	} finally {
+		if (canvasRequests.get(token) === result) canvasRequests.delete(token);
+	}
+}
 
 import { openrouter_key as configuredOpenrouterKey } from './secrets.js';
 const openrouter_key = process.env.OPENROUTER_API_KEY || configuredOpenrouterKey;
@@ -55,13 +79,14 @@ function queueCanvasSync() {
 	scheduleQueuedSync();
 }
 
-// Persist a complete source and its AI facts together. CourseSnapshots are only
-// rebuilt after discovery and cleanup finish, so clients never see partial work.
+// Publish checkpoints atomically with respect to other course workers.
 async function partialSave() {
-	await db.execute('COMMIT');
-	syncTransactionStarted = false;
-	await db.execute('BEGIN IMMEDIATE');
-	syncTransactionStarted = true;
+	await withSyncDb(async () => {
+		await db.execute('COMMIT');
+		syncTransactionStarted = false;
+		await db.execute('BEGIN IMMEDIATE');
+		syncTransactionStarted = true;
+	});
 }
 
 const openrouter_url = "https://openrouter.ai/api/v1/";
@@ -129,16 +154,19 @@ async function downloadIntoMemory(url, canvas_token) {
 			headers.Authorization = `Bearer ${canvas_token}`;
 		}
 
-		const response = await fetch(target, {
-			headers,
-			signal: AbortSignal.timeout(60_000)
+		return await withCanvasKey(canvas_token, async () => {
+			const response = await fetch(target, {
+				headers,
+				signal: AbortSignal.timeout(60_000)
 		});
 
 		if (!response.ok) {
+			await response.arrayBuffer();
 			return [null, `HTTP error! Status: ${response.status}`, response.status];
 		}
 
 		return [Buffer.from(await response.arrayBuffer()), null, response.status];
+		});
 	} catch (error) {
 		return [null, `Failed to download file into memory: ${error}`, null];
 	}
@@ -187,25 +215,29 @@ async function fetchData(url, canvas_token) {
 		}
 		if (visited.has(next)) throw new Error('Repeated Canvas pagination URL');
 		visited.add(next);
-		const response = await fetch(next, {
-			method: 'GET',
-			headers: {
-				'Authorization': `Bearer ${canvas_token}`,
-				'Content-Type': 'application/json',
-				'Accept': 'application/json+canvas-string-ids'
-			},
-			signal: AbortSignal.timeout(60_000)
+		const page = await withCanvasKey(canvas_token, async () => {
+			const response = await fetch(next, {
+				method: 'GET',
+				headers: {
+					'Authorization': `Bearer ${canvas_token}`,
+					'Content-Type': 'application/json',
+					'Accept': 'application/json+canvas-string-ids'
+				},
+				signal: AbortSignal.timeout(60_000)
 		});
 
 		if (!response.ok) {
-			return [null, "HTTP error! Status: "+response.status+"\nCalling: "+url, response.status];
+			await response.arrayBuffer();
+			return { error: "HTTP error! Status: "+response.status+"\nCalling: "+url, status: response.status };
 		}
 
-		const data = normalizeCanvasIds(await response.json());
+		return { data: normalizeCanvasIds(await response.json()), link: response.headers.get('link') || '' };
+		});
+		if (page.error) return [null, page.error, page.status];
+		const { data, link } = page;
 		if (result === undefined) result = data;
 		else if (Array.isArray(result) && Array.isArray(data)) result.push(...data);
 		else throw new Error('Expected a list from paginated Canvas endpoint');
-		const link = response.headers.get('link') || '';
 		next = Array.isArray(data) ? nextPage(link, next) : null;
 		}
 		return [result, null, null];
@@ -384,6 +416,10 @@ function validateDateFact(fact) {
 }
 
 async function updateSavedEvents(res, from_type, from_id, course_id, module_id) {
+	return withSyncDb(() => saveModelEvents(res, from_type, from_id, course_id, module_id));
+}
+
+async function saveModelEvents(res, from_type, from_id, course_id, module_id) {
 	try {
 		const content = res?.choices?.[0]?.message?.content;
 
@@ -642,6 +678,7 @@ function searchKeywords(text) {
 }
 
 async function processPage(course_id, module_id, page, err, code, canvas_token) {
+	const { page_set } = courseContext.getStore();
 	if (err !== null) {
 		if (code == 404) {
 			return null; // we're going to claim that 404 means 'it does not exist' as was the case with a discussion item
@@ -710,6 +747,7 @@ Body: ${page.body}
 }
 
 async function processAssignment(course_id, module_id, assignment) {
+	const { assignment_set } = courseContext.getStore();
 	if (assignment_set.has(assignment.id)) { // item.content_id is the same
 		return null;
 	}
@@ -790,6 +828,7 @@ Description: ${assignment.description}
 }
 
 async function processQuiz(course_id, module_id, quiz) {
+	const { quiz_set } = courseContext.getStore();
 	const baseDates = Array.isArray(quiz.all_dates) ? quiz.all_dates.find(date => date.base === true) : null;
 	if (Array.isArray(quiz.all_dates)) quiz = { ...quiz, due_at: baseDates?.due_at ?? null, lock_at: baseDates?.lock_at ?? null, unlock_at: baseDates?.unlock_at ?? null };
 	if (quiz_set.has(quiz.id)) { // content_id
@@ -881,6 +920,7 @@ Description: ${quiz.description}
 }
 
 async function processFile(course_id, module_id, item, file, err, code, canvas_token) {
+	const { files_set } = courseContext.getStore();
 	if (err !== null) {
 		if (code == 404) {
 			return null;
@@ -982,6 +1022,7 @@ File: ${file_data}
 }
 
 async function processExternal(course_id, module_id, item) {
+	const { external_set } = courseContext.getStore();
 	if (external_set.has(item.id)) {
 		return null;
 	}
@@ -1016,6 +1057,7 @@ async function processExternal(course_id, module_id, item) {
 }
 
 async function processDiscussion(course_id, module_id, item, discourse, err, code) {
+	const { discussion_set } = courseContext.getStore();
 	if (err !== null) {
 		if (code == 404) return null;
 		return err;
@@ -1086,6 +1128,7 @@ Message: ${discourse.message}
 }
 
 async function processEvent(course_id, module_id, item, canvas_token) {
+	const { external_set, assignment_map, quiz_set, discussion_set, files_set } = courseContext.getStore();
 	if (item.type === "SubHeader") {
 		return null;
 	}
@@ -1132,6 +1175,7 @@ async function processEvent(course_id, module_id, item, canvas_token) {
 }
 
 async function syncAssignments(course_id, canvas_token) {
+	const { assignment_map } = courseContext.getStore();
 	let [assignments, err, code] = await fetchData(base_url+`courses/${course_id}/assignments?override_assignment_dates=false`, canvas_token);
 
 	if (err !== null) {
@@ -1198,6 +1242,7 @@ async function syncEvents(course_id, canvas_token) {
 }
 
 async function ensureAssignments() {
+	const { assignment_map, assignment_set } = courseContext.getStore();
 	let from_modules = new Set(assignment_map.keys());
 	let whatwedidntdo = difference(from_modules, assignment_set);
 
@@ -1238,14 +1283,6 @@ async function runCanvasSync() {
 	syncing = true;
 	syncQueued = false;
 
-	page_set.clear();
-	assignment_set.clear();
-	quiz_set.clear();
-	files_set.clear();
-	external_set.clear();
-	discussion_set.clear();
-
-	assignment_map.clear();
 
 	try {
 		await start();
@@ -1414,111 +1451,18 @@ async function runCanvasSync() {
 		const courseError = await syncCourses(courseAndToken);
 		if (courseError !== null) throw new Error(courseError);
 		await partialSave();
-		const syncedCourses = new Set(courseAndToken.map(([id]) => id));
-
-		for (const [course_id, canvas_token] of courseAndToken) {
-			console.log(`Course... ${course_id}`);
-
-			let err = await syncEvents(course_id, canvas_token);
-
-			if (err !== null) {
-				throw new Error(err);
-			}
-
-			err = await syncAssignments(course_id, canvas_token);
-
-			if (err !== null) {
-				throw new Error(err);
-			}
-		}
-
-		console.log("Ensure assignments");
-		const ensureError = await ensureAssignments();
-		if (ensureError !== null) throw new Error(ensureError);
-		console.log("Deleting unused entries");
-
-		{
-			const existing = (await db.query('SELECT * FROM Pages')).filter(row => syncedCourses.has(row.course_id));
-			const existingIds = new Set(existing.map(r => r.id));
-			const goneNow = difference(existingIds, page_set);
-
-			for (const p_id of goneNow) {
-				// delete this page id
-				await deletePageSaved(p_id);
-			}
-		}
-
-		{
-			const existing = (await db.query('SELECT * FROM Assignments')).filter(row => syncedCourses.has(row.course_id));
-			const existingIds = new Set(existing.map(r => r.id));
-			const goneNow = difference(existingIds, assignment_set);
-
-			for (const a_id of goneNow) {
-				// delete this assignment id
-				await deleteAssignmentSaved(a_id);
-			}
-		}
-
-		{
-			const existing = (await db.query('SELECT * FROM Quizzes')).filter(row => syncedCourses.has(row.course_id));
-			const existingIds = new Set(existing.map(r => r.id));
-			const goneNow = difference(existingIds, quiz_set);
-
-			for (const q_id of goneNow) {
-				// delete this quiz id
-				await deleteQuizSaved(q_id);
-			}
-		}
-
-		{
-			const existing = (await db.query('SELECT * FROM Files')).filter(row => syncedCourses.has(row.course_id));
-			const existingIds = new Set(existing.map(r => r.id));
-			const goneNow = difference(existingIds, files_set);
-
-			for (const f_id of goneNow) {
-				// delete this file id
-				await deleteFileSaved(f_id);
-			}
-		}
-
-		{
-			const existing = (await db.query('SELECT * FROM Externals')).filter(row => syncedCourses.has(row.course_id));
-			const existingIds = new Set(existing.map(r => r.id));
-			const goneNow = difference(existingIds, external_set);
-
-			for (const e_id of goneNow) {
-				// delete this external id
-				await deleteExternalSaved(e_id);
-			}
-		}
-
-		{
-			const existing = (await db.query('SELECT * FROM Discussions')).filter(row => syncedCourses.has(row.course_id));
-			const existingIds = new Set(existing.map(r => r.id));
-			const goneNow = difference(existingIds, discussion_set);
-
-			for (const d_id of goneNow) {
-				// delete this discussion id
-				await deleteDiscussionSaved(d_id);
-			}
-		}
-
-		// Now we need to identify all exsisting SavedEvents which no longer have an associated DateFact
-
-		const existing_saved_events = new Set((await db.query('SELECT id, course_id FROM SavedEvents')).filter(r => syncedCourses.has(r.course_id)).map(r => r.id));
-		const existing_references_dates = new Set((await db.query('SELECT applies_to FROM DateFacts')).map(r => r.applies_to));
-		const existing_references_creations = new Set((await db.query('SELECT applies_to FROM CreationFacts')).map(r => r.applies_to));
-		// find ones that no longer have references
-
-		const all_refs = new Set([...existing_references_dates, ...existing_references_creations]);
-		const no_references = difference(existing_saved_events, all_refs);
-
-		for (const event_id of no_references) {
-			// delete the saved event which no longer has any references
-			await db.run(`DELETE FROM SavedEvents WHERE id = ?`, [event_id]);
-		}
-
-		await precomputeCourses(syncedCourses);
+		// Drain every worker before rollback/close, even if another course fails.
+		const results = await Promise.allSettled(courseAndToken.map(([course_id, canvas_token]) =>
+			courseContext.run(newCourseState(), async () => {
+				console.log(`Course... ${course_id}`);
+				for (const operation of [syncEvents, syncAssignments]) {
+					const error = await operation(course_id, canvas_token);
+					if (error !== null) throw new Error(error);
+				}
+				await finishCourse(course_id);
+			})));
+		const failed = results.find(result => result.status === 'rejected');
+		if (failed) throw failed.reason;
 		await db.execute('COMMIT');
 		syncTransactionStarted = false;
 		console.log("Done");
@@ -1535,6 +1479,33 @@ async function runCanvasSync() {
 			scheduleQueuedSync();
 		}
 	}
+}
+
+// Cleanup and publish only after this course's discovery and AI work finish.
+async function finishCourse(courseId) {
+	const ensureError = await ensureAssignments();
+	if (ensureError !== null) throw new Error(ensureError);
+	await withSyncDb(async () => {
+		const state = courseContext.getStore();
+		for (const [table, seen, remove] of [
+			['Pages', state.page_set, deletePageSaved],
+			['Assignments', state.assignment_set, deleteAssignmentSaved],
+			['Quizzes', state.quiz_set, deleteQuizSaved],
+			['Files', state.files_set, deleteFileSaved],
+			['Externals', state.external_set, deleteExternalSaved],
+			['Discussions', state.discussion_set, deleteDiscussionSaved]
+		]) {
+			const existing = await db.query(`SELECT id FROM ${table} WHERE course_id = ?`, [courseId]);
+			for (const row of existing) {
+				if (!seen.has(row.id)) await remove(row.id);
+			}
+		}
+		await db.run(`DELETE FROM SavedEvents WHERE course_id = ?
+			AND NOT EXISTS (SELECT 1 FROM DateFacts WHERE applies_to = SavedEvents.id)
+			AND NOT EXISTS (SELECT 1 FROM CreationFacts WHERE applies_to = SavedEvents.id)`, [courseId]);
+		await precomputeCourses(new Set([courseId]));
+		await partialSave();
+	});
 }
 
 // User registration transactions are serialized because requests can overlap.

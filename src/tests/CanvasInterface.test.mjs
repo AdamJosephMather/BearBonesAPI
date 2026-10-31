@@ -17,7 +17,7 @@ const users = new DatabaseManager(process.env.USER_DB_PATH);
 const sync = async () => { await api.getClientSync('test-token'); await api.canvasSync(); };
 const json = (data, headers = {}) => new Response(JSON.stringify(data), { headers });
 const modelResult = (title = 'Deadline') => ({ choices: [{ message: { content: JSON.stringify({
-	new_events: [{ title, description: 'Details', dates: [{ title: 'Due', date: '15/10/2026', time: '14:00' }] }],
+	new_events: [{ title, description: 'Details', dates: [{ title: 'Due', date: '15/10/2026', time: '14:00', show: true }] }],
 	additions: []
 }) } }] });
 
@@ -69,7 +69,7 @@ test('Canvas sync regression coverage with mocked HTTP and real SQLite', async t
 				]);
 			case '/page':
 				if (forbidden) return new Response('', { status: 403 });
-				return json({ page_id: 11, title: 'Page', body: 'Body ' + version, updated_at: String(version) });
+				return json({ page_id: 11, title: 'Assignment deadline', body: 'Body ' + version, updated_at: String(version) });
 			case '/quiz':
 				return json({ id: 20, title: 'Quiz', description: 'Quiz ' + version, version_number: version, published: true, locked_for_user: false, due_at: '2026-11-20T20:00:00Z', assignment_id: 50, all_dates: [{ base: true, due_at: '2026-10-15T20:00:00Z' }] });
 			case '/discussion':
@@ -254,16 +254,16 @@ test('Canvas sync regression coverage with mocked HTTP and real SQLite', async t
 			const initial = (await db.query('SELECT * FROM SavedEvents')).length;
 			const response = value => ({ choices: [{ message: { content: JSON.stringify(value) } }] });
 			const error = await api.updateSavedEvents(response({ new_events: [{
-				title: 'Invalid', description: 'x', dates: [{ title: 'Due', date: '31/02/2026', time: '14:00' }]
+				title: 'Invalid', description: 'x', dates: [{ title: 'Due', date: '31/02/2026', time: '14:00', show: true }]
 			}] }), 'page', '1', '1', '10');
 			assert.match(error, /calendar date/);
 			const event = (await db.query('SELECT id FROM SavedEvents LIMIT 1'))[0];
 			assert.match(await api.updateSavedEvents(response({ additions: [{
-				event_id: event.id, title: 'Due', date: '15/10/2026'
+				event_id: event.id, title: 'Due', date: '15/10/2026', show: true
 			}] }), 'page', '1', 'other-course', null), /this course/);
 			assert.equal((await db.query('SELECT * FROM SavedEvents')).length, initial);
 			assert.equal(await api.updateSavedEvents(response({ new_events: [{
-				title: 'No additions array', description: 'x', dates: [{ title: 'Due', date: '29/02/2028' }]
+				title: 'No additions array', description: 'x', dates: [{ title: 'Due', date: '29/02/2028', show: false }]
 			}] }), 'page', '1', '1', null), null);
 			const saved = (await db.query("SELECT * FROM SavedEvents WHERE title = 'No additions array'"))[0];
 			assert.equal((await db.query('SELECT time FROM DateFacts WHERE applies_to = ?', [saved.id]))[0].time, null);
