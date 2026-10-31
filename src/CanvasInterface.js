@@ -599,6 +599,10 @@ async function getPageFile(page_course_id, module_id, page_id, file_course_id, f
 	} else {
 		file_data = text;
 	}
+	
+	if (!searchKeywords(file_data, true)) { // no keywords - skip this // true for filedata (stricter)
+		return null; // we do have updated_at, but that's generally not important
+	}
 
 	const prompt = await createPrompt(page_course_id, module_id, `# File:
 
@@ -643,37 +647,72 @@ function extractFilesLinks(content) {
 	return results;
 }
 
-function searchKeywords(text) {
+function searchKeywords(text, isFile = false) {
 	if (typeof text !== 'string' || !text.trim()) return false;
 
-	// Search visible source text, not URLs, HTML attributes, or the full AI prompt.
-	// Keep this broad: a false positive costs a request; a false negative loses a date.
 	const content = text
 		.replace(/<!--[\s\S]*?-->/g, ' ')
 		.replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
 		.replace(/<[^>]*>/g, ' ')
 		.replace(/https?:\/\/[^\s<>]+|\/(?:api\/v1\/)?(?:courses\/\d+\/)?files\/[^\s<>]+/gi, ' ')
 		.replace(/&#(x[0-9a-f]+|\d+);/gi, (entity, code) => {
-			const value = code[0].toLowerCase() === 'x' ? parseInt(code.slice(1), 16) : Number(code);
+			const value = code[0].toLowerCase() === 'x'
+				? parseInt(code.slice(1), 16)
+				: Number(code);
 			return value <= 0x10ffff ? String.fromCodePoint(value) : entity;
 		})
 		.replace(/&(?:nbsp|ensp|emsp|thinsp);/gi, ' ')
 		.replace(/&sol;/gi, '/')
 		.replace(/&colon;/gi, ':');
 
-	return [
-		// Full names and common abbreviations, with boundaries to avoid "summary"/"maybe".
+	const temporalPatterns = [
 		/\b(?:mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b/i,
 		/\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b/i,
-		// Numeric dates, including ISO dates and dates without a year.
-		/\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?=T|\b)|\b\d{1,2}[-/.]\d{1,2}(?:[-/.]\d{2,4})?\b/i,
 		/\b(?:today|tonight|tomorrow|yesterday|noon|midnight|daily|weekly|monthly|fortnight)\b/i,
 		/\b(?:this|next|last|coming|following|every|each)\s+(?:day|week|weekend|month|year|morning|afternoon|evening|night)\b/i,
 		/\b(?:in|within|after|before)\s+(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|couple\s+of)\s+(?:hours?|days?|weeks?|months?)\b/i,
 		/\b(?:[01]?\d|2[0-3]):[0-5]\d\b|\b(?:1[0-2]|0?[1-9])\s*(?:a\.?m\.?|p\.?m\.?)\b/i,
-		// Dates can be implied by surrounding course context rather than spelled out.
-		/\b(?:due|deadlines?|exam(?:ination)?s?|midterms?|quizz?es|quiz|tests?|meetings?|appointments?|presentations?|submissions?|submit|scheduled?|schedules?)\b/i,
 		/\b\d{1,2}(?:st|nd|rd|th)\b/i
+	];
+
+	if (temporalPatterns.some(pattern => pattern.test(content))) return true;
+
+	function validDate(month, day, year) {
+		return month >= 1 && month <= 12 &&
+			day >= 1 &&
+			day <= new Date(Date.UTC(year, month, 0)).getUTCDate();
+	}
+
+	const numericDates =
+		/\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?=T|\b)|\b(\d{1,2})([-/.])(\d{1,2})(?:\5(\d{2,4}))?\b/g;
+
+	for (const match of content.matchAll(numericDates)) {
+		if (match[1]) {
+			// Year first: YYYY-MM-DD, including ISO timestamps.
+			if (validDate(+match[2], +match[3], +match[1])) return true;
+		} else {
+			// Avoid treating decimals such as 0.09 or 1.42 as dates.
+			if (match[5] === '.' && !match[7]) continue;
+
+			const year = match[7]
+				? (+match[7] < 100 ? 2000 + +match[7] : +match[7])
+				: 2000;
+
+			// Accept both month/day and day/month conventions.
+			if (
+				validDate(+match[4], +match[6], year) ||
+				validDate(+match[6], +match[4], year)
+			) return true;
+		}
+	}
+
+	// Files need an actual temporal match. Generic words such as
+	// "exam" and "test" are very common in lecture/practice material.
+	if (isFile) return false;
+
+	return [
+		/\b(?:due|deadlines?|exam(?:ination)?s?|midterms?|quizz?es|quiz|tests?|meetings?|appointments?|presentations?|submissions?|submit|scheduled?|schedules?)\b/i,
+		/\b(?:weeks?\s+\d+|(?:start|end|beginning)\s+of\s+(?:(?:the|this|next|each|every)\s+)*(?:week|month|term|semester|module|class|lecture|lab)|now\s+(?:available|open)|(?:available|open)\s+now)\b/i
 	].some(pattern => pattern.test(content));
 }
 
@@ -701,7 +740,8 @@ async function processPage(course_id, module_id, page, err, code, canvas_token) 
 	if (deleted || existing.length === 0) {
 		console.log("Added page "+page.title);
 		
-		let needsEval = searchKeywords(page.title+" "+page.body);
+		let needsEval = searchKeywords(page.title+" "+page.body, false); // isfile
+		// we could look at page.updated_at, but that's generally not that important. It's better as context
 		
 		if (needsEval) {
 			const prompt = await createPrompt(course_id, module_id, `# Page:
@@ -960,6 +1000,10 @@ async function processFile(course_id, module_id, item, file, err, code, canvas_t
 			file_data = `[File content unavailable: ${extractErr}]`;
 		} else {
 			file_data = text;
+		}
+		
+		if (!searchKeywords(file_data, true)) { // skip if not needed. // isfile = true
+			return null;
 		}
 
 		const prompt = await createPrompt(course_id, module_id, `# File:

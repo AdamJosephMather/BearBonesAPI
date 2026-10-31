@@ -11,7 +11,7 @@ test('page filtering retains dates, relative dates, times, and actionable contex
 		'Midterm information', 'Quiz preparation', 'On the 15th',
 		'<p>Next&nbsp;week</p>', '<p>October <strong>15</strong></p>',
 		'<p>15&#47;10&#47;2026</p>', '<p>&#77;onday</p>'
-	]) assert.equal(searchKeywords(text), true, text);
+	]) assert.equal(searchKeywords(text, false), true, text);
 });
 
 test('page filtering skips empty content, ordinary prose, and HTML URL metadata', () => {
@@ -23,5 +23,5 @@ test('page filtering skips empty content, ordinary prose, and HTML URL metadata'
 		'<p>Reading materials</p><!-- Deadline Monday -->',
 		'<script>const day = "Monday";</script><style>.may { color: red; }</style>',
 		'https://canvas.test/courses/123/files/456/download?date=2026-10-15'
-	]) assert.equal(searchKeywords(text), false, String(text));
+	]) assert.equal(searchKeywords(text, false), false, String(text));
 });
