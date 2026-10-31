@@ -328,7 +328,7 @@ Output will be:
 A single JSON object detailing new events and updates to existing events.
 
 ALL DATES ARE PROVIDED/EXPECTED IN DD/MM/YYYY.
-ALL TIMES ARE PROVIDED/EXPECTED IN HH:mm (24hr).
+ALL TIMES ARE PROVIDED/EXPECTED IN HH:mm (24hr), or null when the date has no specific time (an all-day date).
 
 Dates and times are already local to America/Edmonton. Preserve that timezone.
 Course: ${courseName}. Module: ${moduleName}.
@@ -346,7 +346,7 @@ The output schema will be:
 				{
 					"title":STRING,
 					"date":STRING,
-					"time":STRING,
+					"time":STRING|null,
 					"show":BOOL
 				}
 			]
@@ -357,7 +357,7 @@ The output schema will be:
 			"event_id":INT,
 			"title":STRING,
 			"date":STRING,
-			"time":STRING,
+			"time":STRING|null,
 			"show":BOOL
 		}
 	]
@@ -381,6 +381,8 @@ A lock or close date should be shown if it represents the effective submission d
 When uncertain, prefer \`false\` for passive availability changes and \`true\` for dates requiring the student to complete something, attend something, or be somewhere at a particular time.
 
 Record relevant dates even when \`show\` is \`false\`; the field only controls calendar visibility, not whether the date is stored.
+
+Set \`time\` to \`null\` (not an empty string or a placeholder like "00:00") when only a date is known. Use an actual \`HH:mm\` value only when a specific time is given.
 
 The event_id in additions is for the event for which an additional date has been discovered.
 
