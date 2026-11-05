@@ -20,19 +20,21 @@ test('page and module files handle relative URLs and restricted metadata without
 	let version = 1;
 	let failDownload = false;
 	const files = [
-		{ id: '1', locked_for_user: true },
+		{ id: '1', locked_for_user: true, hidden_for_user: true, url: '/locked' },
 		{ id: '2', hidden_for_user: true, url: '/hidden' },
 		{ id: '3' },
 		{ id: '4', url: '/files/4/download' },
 		{ id: '5', url: 'https://cdn.test/file.txt' },
-		{ id: '6', url: '   ' }
+		{ id: '6', url: '   ' },
+		{ id: '7', hidden_for_user: true, url: '/denied' }
 	];
 	globalThis.fetch = async (url, options) => {
 		url = new URL(url);
 		if (url.hostname === 'openrouter.ai') return json({ choices: [{ message: {
 			content: JSON.stringify({ new_events: [], additions: [] })
 		} }] });
-		if (url.hostname === 'cdn.test' || url.pathname === '/files/4/download') {
+		if (url.pathname === '/denied') return new Response('', { status: 403 });
+		if (url.hostname === 'cdn.test' || url.pathname === '/files/4/download' || url.pathname === '/hidden') {
 			downloads.push(url.href);
 			assert.equal(options.headers.Authorization,
 				url.hostname === 'canvas.test' ? 'Bearer test-token' : undefined);
@@ -62,10 +64,12 @@ test('page and module files handle relative URLs and restricted metadata without
 		await api.getClientSync('test-token');
 		await api.canvasSync();
 		assert.deepEqual(downloads, [
+			'https://canvas.test/hidden',
 			'https://canvas.test/files/4/download', 'https://cdn.test/file.txt',
+			'https://canvas.test/hidden',
 			'https://canvas.test/files/4/download', 'https://cdn.test/file.txt'
 		]);
-		assert.deepEqual((await db.query('SELECT id FROM Files ORDER BY id')).map(row => row.id), ['4', '5']);
+		assert.deepEqual((await db.query('SELECT id FROM Files ORDER BY id')).map(row => row.id), ['2', '4', '5']);
 		const snapshot = (await db.query('SELECT payload FROM CourseSnapshots'))[0].payload;
 		version++;
 		failDownload = true;

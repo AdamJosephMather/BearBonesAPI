@@ -265,7 +265,9 @@ function normalizeCanvasIds(value) {
 
 function fileUnavailable(file) {
 	// Canvas can return metadata without a download URL for restricted files.
-	return file.locked_for_user || file.hidden_for_user ||
+	// Both callers follow explicit page/module links. Hidden files may still be
+	// accessible there; let Canvas enforce access when downloading the file.
+	return file.locked_for_user ||
 		typeof file.url !== 'string' || !file.url.trim();
 }
 
@@ -577,19 +579,25 @@ async function updateSourceLocation(table, type, id, course_id, module_id) {
 }
 
 async function getPageFile(page_course_id, module_id, page_id, file_course_id, file_id, canvas_token, updated_at) {
+	const label = `Page ${page_id}, file ${file_id}`;
 	let [file, err, code] = await fetchData(base_url+`courses/${file_course_id}/files/${file_id}`, canvas_token);
 
 	if (err !== null && (code == 404 || code == 403 || code == 401)) {
+		console.log(`${label}: skipped, metadata HTTP ${code}`);
 		return null; // whatever, we're not allowed to see it... :(
 	}else if (err !== null) {
 		return err;
 	}
-	if (fileUnavailable(file)) return null;
+	if (fileUnavailable(file)) {
+		console.log(`${label}: skipped, ${file.locked_for_user ? 'locked for user' : 'no download URL'}`);
+		return null;
+	}
 	
 	let file_data;
 	const [buffer, dlErr, filecode] = await downloadIntoMemory(file.url, canvas_token);
 	if (dlErr !== null) {
 		if (filecode == 403 || filecode == 401) {
+			console.log(`${label}: skipped, download HTTP ${filecode}`);
 			return null;
 		}
 		return dlErr;
@@ -597,15 +605,18 @@ async function getPageFile(page_course_id, module_id, page_id, file_course_id, f
 
 	const [text, extractErr] = await extractFileText(buffer, file.filename);
 	if (extractErr !== null) {
+		console.log(`${label}: skipped, ${extractErr}`);
 		return null; // couldn't extract data, pack it up, go home
 	} else {
 		file_data = text;
 	}
 	
 	if (!searchKeywords(file_data, true)) { // no keywords - skip this // true for filedata (stricter)
+		console.log(`${label}: skipped, no temporal keywords in ${file_data.length} characters`);
 		return null; // we do have updated_at, but that's generally not important
 	}
 
+	console.log(`${label}: sending ${file_data.length} characters to model`);
 	const prompt = await createPrompt(page_course_id, module_id, `# File:
 
 Last updated at: ${updated_at}
@@ -765,10 +776,11 @@ Body: ${page.body}
 				return err;
 			}
 		}else{
-			console.log("skip");
+			console.log(`Page ${page.page_id}: skipped page text, no keywords; checking linked files`);
 		}
 		
 		const files = extractFilesLinks(page.body);
+		console.log(`Page ${page.page_id}: found ${files.length} linked files`);
 		for (const [c_id, f_id] of files) {
 			let err = await getPageFile(course_id, module_id, page.page_id, c_id, f_id, canvas_token, formatCanvasDate(page.updated_at));
 			if (err != null) {
